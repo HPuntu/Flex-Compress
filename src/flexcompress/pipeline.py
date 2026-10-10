@@ -30,18 +30,16 @@ import time
 from itertools import combinations
 
 import numpy as np
-from scipy.linalg import eigh as scipy_eigh
 
+from . import accel
 from . import diagnostics as dg
-from .baselines import dct_truncate, fit_pca_exp, pca_exp_candidates, pca_exp_model
+from .baselines import fit_pca_exp, pca_exp_candidates, pca_exp_model
 from .data import Target, load_replica, load_static
 from .frames import residue_frames, to_local
 from .kernels import kernel_matrix
 from .metrics import METRICS, distortion, summarize
 from .spectral import (
     band_timescales,
-    fit_local_residual,
-    fit_psd_bands,
     model_from_components,
     spectral_components,
     subspace_model,
@@ -49,12 +47,9 @@ from .spectral import (
 from .stats import (
     Lagged,
     center,
-    cross_sums,
-    diag_block_sums,
     lag_grid,
     pair_rows,
     pair_subset,
-    segmented,
     subset_lags,
     window_starts,
 )
@@ -67,7 +62,8 @@ RESULT_SCHEMA = 1
 def config_hash(cfg: dict) -> str:
     """Hash of the scientific configuration (paths and run bookkeeping excluded)."""
 
-    keep = {k: v for k, v in cfg.items() if k not in {"archive_root", "index_path", "run", "selection", "split"}}
+    keep = {k: v for k, v in cfg.items()
+            if k not in {"archive_root", "index_path", "run", "selection", "split", "compute"}}
     return hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -151,9 +147,7 @@ def process_target(target: Target, cfg: dict, log=print) -> tuple[dict, dict | N
     static = load_static(target.archive_path)
     n_res = int(target.n_res)
     bb_pooled_ok = bool(diag_cfg["bb_pca"]) and 12 * n_res <= int(diag_cfg["bb_pooled_max_dim"])
-    bb_sum = np.zeros(12 * n_res) if bb_pooled_ok else None
-    bb_outer = np.zeros((12 * n_res, 12 * n_res)) if bb_pooled_ok else None
-    bb_count = 0
+    bb_pooled = accel.OuterSum(12 * n_res) if bb_pooled_ok else None
     bb_rep: list[dict] = []
     thresholds = diag_cfg["variance_thresholds"]
 
@@ -173,13 +167,10 @@ def process_target(target: Target, cfg: dict, log=print) -> tuple[dict, dict | N
         if loaded["backbone"] is not None:
             flat = loaded["backbone"].reshape(rep.n_frames, 12 * n_res)
             centred = flat - flat.mean(axis=0, keepdims=True)
-            var, _, total = dg.top_pcs(centred, int(diag_cfg["pca_top"]), seed=int(cfg["seed"]))
+            var, _, total = accel.top_pcs(centred, int(diag_cfg["pca_top"]), seed=int(cfg["seed"]))
             bb_rep.append(dg.variance_counts(var, total, thresholds))
-            if bb_pooled_ok:
-                f64 = flat.astype(np.float64)
-                bb_sum += f64.sum(axis=0)
-                bb_outer += f64.T @ f64
-                bb_count += rep.n_frames
+            if bb_pooled is not None:
+                bb_pooled.add(flat)
             del flat, centred
         del loaded
         replicas.append(rep)
@@ -190,6 +181,7 @@ def process_target(target: Target, cfg: dict, log=print) -> tuple[dict, dict | N
         "status": "ok",
         "target": target.to_dict(),
         "config_hash": config_hash(cfg),
+        "compute": accel.info(),
         "dt_ps": dt_ps,
         "stride": stride,
     }
@@ -220,8 +212,8 @@ def process_target(target: Target, cfg: dict, log=print) -> tuple[dict, dict | N
 
     t = time.monotonic()
     for rep in replicas:
-        rep.diag = segmented(rep.dx, lags, segment, diag_block_sums)
-        rep.pair = segmented(rep.dx.reshape(rep.n_frames, 3 * n_res)[:, rows], pair_lags, segment, cross_sums)
+        rep.diag = accel.lagged_diag(rep.dx, lags, segment)
+        rep.pair = accel.lagged_cross(rep.dx.reshape(rep.n_frames, 3 * n_res)[:, rows], pair_lags, segment)
         rep.summary = summarize(rep.diag.mean(), rep.pair.mean())
     timing["statistics"] = time.monotonic() - t
 
@@ -229,7 +221,7 @@ def process_target(target: Target, cfg: dict, log=print) -> tuple[dict, dict | N
     if cfg["stages"].get("stage0", True):
         t = time.monotonic()
         result["stage0"] = _stage0(replicas, static, cfg, n_res, residues, pair_lags, bb_rep,
-                                   (bb_sum, bb_outer, bb_count) if bb_pooled_ok else None)
+                                   bb_pooled)
         timing["stage0"] = time.monotonic() - t
     if cfg["descriptors"].get("enabled", True):
         t = time.monotonic()
@@ -259,7 +251,7 @@ def _stage0(replicas, static, cfg, n_res, residues, pair_lags, bb_rep, bb_pooled
     per_rep_counts, cosines, comps = [], [], []
     for rep in replicas:
         flat = rep.dx.reshape(rep.n_frames, 3 * n_res)
-        var, vec, total = dg.top_pcs(flat, int(dcfg["pca_top"]), seed=seed)
+        var, vec, total = accel.top_pcs(flat, int(dcfg["pca_top"]), seed=seed)
         per_rep_counts.append(dg.variance_counts(var, total, thresholds))
         n_cos = int(dcfg["cosine_pcs"])
         cosines.append(dg.cosine_content(flat @ vec[:, :n_cos], n_cos).tolist())
@@ -268,13 +260,8 @@ def _stage0(replicas, static, cfg, n_res, residues, pair_lags, bb_rep, bb_pooled
     out["ca_pca_per_replica_mean"] = {k: _nanmean([c[k] for c in per_rep_counts]) for k in per_rep_counts[0]}
     weights_t = np.array([rep.n_frames for rep in replicas], dtype=np.float64)
     grand = (np.tensordot(weights_t, np.stack([rep.mean for rep in replicas]), axes=(0, 0)) / weights_t.sum()).reshape(-1)
-    cov = np.zeros((3 * n_res, 3 * n_res))
-    count = 0
-    for rep in replicas:
-        shifted = rep.dx.reshape(rep.n_frames, -1) + (rep.mean.reshape(-1) - grand)[None, :]
-        cov += shifted.T @ shifted
-        count += rep.n_frames
-    w = np.clip(np.linalg.eigvalsh(cov / count)[::-1], 0.0, None)
+    w = accel.eigvalsh_gram([rep.dx.reshape(rep.n_frames, -1) + (rep.mean.reshape(-1) - grand)[None, :]
+                             for rep in replicas])
     out["ca_pca_pooled"] = dg.variance_counts(w, float(w.sum()), thresholds)
     out["cosine_content"] = cosines
     out["cosine_content_mean"] = np.mean(np.asarray(cosines), axis=0).tolist()
@@ -285,12 +272,8 @@ def _stage0(replicas, static, cfg, n_res, residues, pair_lags, bb_rep, bb_pooled
     if bb_rep:
         out["bb_pca_per_replica_mean"] = {k: _nanmean([c[k] for c in bb_rep]) for k in bb_rep[0]}
     if bb_pooled is not None:
-        total_sum, outer, count_bb = bb_pooled
-        mean = total_sum / count_bb
-        cov_bb = outer / count_bb - np.outer(mean, mean)
-        k = min(int(dcfg["pca_top"]), cov_bb.shape[0])
-        w_bb = scipy_eigh(cov_bb, eigvals_only=True, subset_by_index=[cov_bb.shape[0] - k, cov_bb.shape[0] - 1])
-        out["bb_pca_pooled"] = dg.variance_counts(np.clip(w_bb[::-1], 0, None), float(np.trace(cov_bb)), thresholds)
+        w_bb, trace_bb = bb_pooled.top_eigvals(int(dcfg["pca_top"]))
+        out["bb_pca_pooled"] = dg.variance_counts(w_bb, trace_bb, thresholds)
 
     # Sampling / stationarity.
     msf_within = np.mean([float(np.sum(rep.summary["msf"])) for rep in replicas])
@@ -380,11 +363,13 @@ def _descriptors(replicas, static, cfg, lags, dt_ps, segment):
     weights = np.ones(len(lags))
     desc, energy, msf = [], [], []
     kern = kernel_matrix(bands_frames, segment, lags)
-    for rep in replicas:
-        q, _ = fit_psd_bands(rep.diag.mean(), kern, weights, ridge=float(cfg["spectral"]["ridge"]),
-                             max_iter=int(cfg["spectral"]["local_max_iter"]), tol=float(cfg["spectral"]["tol"]),
-                             obj_tol=float(cfg["spectral"]["obj_tol"]))
-        local = to_local(q, frames)  # (B, N, 3, 3)
+    # One batched fit for all replicas: (L, n_rep, N, 3, 3) -> (B, n_rep, N, 3, 3).
+    q_all, _ = accel.fit_psd_bands(np.stack([rep.diag.mean() for rep in replicas], axis=1), kern, weights,
+                                   ridge=float(cfg["spectral"]["ridge"]),
+                                   max_iter=int(cfg["spectral"]["local_max_iter"]),
+                                   tol=float(cfg["spectral"]["tol"]), obj_tol=float(cfg["spectral"]["obj_tol"]))
+    for i, rep in enumerate(replicas):
+        local = to_local(q_all[:, i], frames)  # (B, N, 3, 3)
         emb = logm_sym6(local, float(dcfg["eps_A2"]))  # (B, N, 6)
         desc.append(np.transpose(emb, (1, 0, 2)).reshape(emb.shape[1], -1))
         energy.append(np.trace(local, axis1=-2, axis2=-1))
@@ -417,11 +402,18 @@ def _descriptors(replicas, static, cfg, lags, dt_ps, segment):
 
 
 def _stage1(replicas, cfg, n_res, lags, pair_lags, residues, dt_ps, segment, log) -> dict:
+    """Leave-one-replica-out rate-distortion, organised for batched (GPU) solves.
+
+    Every statistic shares one window length, so all folds share one kernel
+    matrix.  That lets the collective fits of all folds run as a single batched
+    ADMM solve, and the per-residue local fits of every (fold, codec, rank) as
+    another, instead of dozens of small sequential solves.
+    """
+
     scfg, bcfg = cfg["spectral"], cfg["baselines"]
     n_rep = len(replicas)
     bands = band_timescales(segment, float(scfg["bands_per_decade"]), float(scfg["max_timescale_fraction"]),
                             subframe=bool(scfg["subframe_band"]))
-    # Every statistic uses length-`segment` windows: one kernel for fits and targets.
     kern = kernel_matrix(bands, segment, lags)
     kern_pair = kernel_matrix(bands, segment, pair_lags)
     weights = np.ones(len(lags))
@@ -433,109 +425,110 @@ def _stage1(replicas, cfg, n_res, lags, pair_lags, residues, dt_ps, segment, log
     common = dict(ridge=float(scfg["ridge"]), tol=float(scfg["tol"]), obj_tol=float(scfg["obj_tol"]))
     fit_kw = dict(common, max_iter=int(scfg["max_iter"]))
     local_kw = dict(common, max_iter=int(scfg["local_max_iter"]))
-    rows_out: list[dict] = []
-    fits: list[dict] = []
     dim = 3 * n_res
     k_pc = min(dim, int(scfg["pc_max"]))
+    rows_cols = pair_rows(residues)
 
+    # Phase 1: per-fold statistics, floor and PC basis.
+    folds = []
     for h in holdouts:
         held = replicas[h]
         fit_set = [r for i, r in enumerate(replicas) if i != h]
-        fit_frames = [r.n_frames for r in fit_set]
-        target = held.summary
         diag_fit = Lagged.pool([r.diag for r in fit_set]).mean()
         pair_fit = Lagged.pool([r.pair for r in fit_set]).mean()
-        base = {"fold": held.name, "n_fit": len(fit_set)}
-
-        def record(method, param, params_per_res, metrics, base=base, **extra):
-            row = dict(base, method=method, param=param, params_per_res=params_per_res)
-            row.update(extra)
-            row.update(metrics)
-            rows_out.append(row)
-
-        floor = distortion(summarize(diag_fit, pair_fit), target)
-        record("floor", None, float("nan"), floor)
-
-        # Common PC basis from the pooled lag-0 covariance of the fit replicas.
-        cov0 = np.zeros((dim, dim))
-        for r in fit_set:
-            flat = r.dx.reshape(r.n_frames, dim)
-            cov0 += flat.T @ flat
-        cov0 /= float(sum(fit_frames))
-        evals, basis = scipy_eigh(cov0, subset_by_index=[dim - k_pc, dim - 1])
-        order = np.argsort(evals)[::-1]
-        evals, basis = np.clip(evals[order], 0.0, None), basis[:, order]
-        captured = float(evals.sum() / max(np.trace(cov0), 1e-300))
-        pc_stats = Lagged.pool([segmented(r.dx.reshape(r.n_frames, dim) @ basis, lags, segment, cross_sums)
+        evals, basis, trace0 = accel.gram_top_eigh([r.dx.reshape(r.n_frames, dim) for r in fit_set], k_pc)
+        pc_stats = Lagged.pool([accel.lagged_cross(r.dx.reshape(r.n_frames, dim), lags, segment, basis=basis)
                                 for r in fit_set]).mean()
-        kern_fit = kern_h = kern
-        kern_h_pair = kern_pair
-        amplitudes, info = fit_psd_bands(pc_stats, kern_fit, weights, **fit_kw)
-        comps = spectral_components(amplitudes, basis)
-        band_var = np.array([np.trace(a) for a in amplitudes])
-        fits.append(
-            dict(
-                fold=held.name, k_pc=k_pc, pc_captured=captured, n_components=len(comps),
-                fit_iterations=info["iterations"], fit_converged=info["converged"], fit_stop=info["stop"],
-                fit_rel_residual=info["rel_residual"],
-                band_variance_fraction=(band_var / max(band_var.sum(), 1e-300)).tolist(),
-            )
-        )
+        fold = {"held": held, "fit_set": fit_set, "target": held.summary, "diag_fit": diag_fit, "basis": basis,
+                "captured": float(evals.sum() / max(trace0, 1e-300)), "pc_stats": pc_stats, "rows": []}
+        fold["rows"].append(_row(fold, "floor", None, float("nan"), distortion(summarize(diag_fit, pair_fit),
+                                                                              held.summary)))
+        folds.append(fold)
 
-        # Spectral codecs.  "subspace": shared top-R spatial subspace with a full
-        # PSD core per band (primary).  "band": top-R (band, pattern) pairs.
-        # "_local" adds per-residue band tensors fitted to the diagonal residual.
+    # Phase 2: all folds' collective fits in one batched solve, (L, F, K, K) -> (B, F, K, K).
+    amplitudes, info = accel.fit_psd_bands(np.stack([f["pc_stats"] for f in folds], axis=1), kern, weights,
+                                           **fit_kw)
+    fits = []
+    for i, fold in enumerate(folds):
+        fold["amplitudes"] = amplitudes[:, i]
+        fold["comps"] = spectral_components(fold["amplitudes"], fold["basis"])
+        band_var = np.array([np.trace(a) for a in fold["amplitudes"]])
+        fits.append(dict(
+            fold=fold["held"].name, k_pc=k_pc, pc_captured=fold["captured"], n_components=len(fold["comps"]),
+            fit_iterations=info["iterations"], fit_converged=info["converged"], fit_stop=info["stop"],
+            fit_rel_residual=info["rel_residual"], fit_batched_folds=len(folds),
+            band_variance_fraction=(band_var / max(band_var.sum(), 1e-300)).tolist(),
+        ))
+
+    # Phase 3: build every spectral model ("subspace": shared top-R spatial
+    # subspace with a PSD core per band, primary; "band": top-R (band, pattern)
+    # pairs; "_local": + per-residue band tensors) and solve all local residual
+    # fits together, (L, M, N, 3, 3) -> (B, M, N, 3, 3).
+    pending, residuals = [], []
+    for i, fold in enumerate(folds):
         for codec in scfg["codecs"]:
             truncation, use_local = codec.split("_")[0], codec.endswith("_local")
-            local_init = None  # warm start: neighbouring ranks have similar residuals
-            limit = k_pc if truncation == "subspace" else len(comps)
+            limit = k_pc if truncation == "subspace" else len(fold["comps"])
             grid = {int(r) for r in scfg["ranks"] if int(r) <= limit}
             for rank in sorted(grid | {limit}):
                 if rank == 0 and not use_local:
                     continue
                 if truncation == "subspace":
-                    model = subspace_model(bands, amplitudes, basis, rank)
+                    model = subspace_model(bands, fold["amplitudes"], fold["basis"], rank)
                     params = model.n_params(use_local)
                 elif truncation == "band":
-                    model = model_from_components(bands, comps, rank)
+                    model = model_from_components(bands, fold["comps"], rank)
                     params = (dim * rank + rank) / n_res + (6 * len(bands) if use_local else 0)
                 else:
                     raise ValueError(f"unknown spectral codec {codec!r}")
+                slot = None
                 if use_local:
-                    low_diag = np.tensordot(kern_fit, model.band_diag(), axes=(1, 0))
-                    local, _ = fit_local_residual(diag_fit, low_diag, kern_fit, weights, init=local_init,
-                                                  **local_kw)
-                    local_init = local
-                    model = model.with_local(local)
-                diag_p, pair_p = model.predict(kern_h, kern_h_pair, residues)
-                record(f"spectral_{codec}", rank, params, distortion((diag_p, pair_p), target),
-                       full_rank=bool(rank == limit), on_grid=bool(rank in grid))
+                    slot = len(residuals)
+                    residuals.append(fold["diag_fit"] - np.tensordot(kern, accel.band_diag(model), axes=(1, 0)))
+                pending.append((i, codec, rank, model, params, slot, rank == limit, rank in grid))
+    local_all = None
+    if residuals:
+        local_all, _ = accel.fit_psd_bands(np.stack(residuals, axis=1), kern, weights, **local_kw)
+    for i, codec, rank, model, params, slot, full, on_grid in pending:
+        fold = folds[i]
+        if slot is not None:
+            model = model.with_local(local_all[:, slot])
+        diag_p, pair_p = accel.predict(model, kern, kern_pair, residues)
+        fold["rows"].append(_row(fold, f"spectral_{codec}", rank, params, distortion((diag_p, pair_p), fold["target"]),
+                                 full_rank=bool(full), on_grid=bool(on_grid)))
 
+    # Phase 4: baselines.
+    for fold in folds:
         # PCA + one relaxation time per PC.
-        amp, best = fit_pca_exp(np.diagonal(pc_stats, axis1=1, axis2=2), basis, [segment], lags, candidates, weights)
-        kc_h, kc_h_pair = kc, kc_pair
+        amp, best = fit_pca_exp(np.diagonal(fold["pc_stats"], axis1=1, axis2=2), fold["basis"], [segment], lags,
+                                candidates, weights)
         for rank in sorted({int(r) for r in bcfg["pca_exp_ranks"] if int(r) <= k_pc}):
-            model = pca_exp_model(basis, amp, best, candidates, rank)
-            diag_p, pair_p = model.predict(kc_h, kc_h_pair, residues)
-            record("pca_exp", rank, (dim * rank + 2 * rank) / n_res, distortion((diag_p, pair_p), target))
-
+            model = pca_exp_model(fold["basis"], amp, best, candidates, rank)
+            diag_p, pair_p = accel.predict(model, kc, kc_pair, residues)
+            fold["rows"].append(_row(fold, "pca_exp", rank, (dim * rank + 2 * rank) / n_res,
+                                     distortion((diag_p, pair_p), fold["target"])))
         # Truncated DCT of each fit replica's realisation.
-        keeps = [int(k) for k in bcfg["dct_keep"] if int(k) < min(fit_frames)]
-        rows_cols = pair_rows(residues)
-        for keep in keeps:
-            diag_items, pair_items = [], []
-            for r in fit_set:
-                recon = dct_truncate(r.dx.reshape(r.n_frames, dim), keep)
-                diag_items.append(segmented(recon.reshape(r.n_frames, n_res, 3), lags, segment, diag_block_sums))
-                pair_items.append(segmented(recon[:, rows_cols], pair_lags, segment, cross_sums))
-            pred = summarize(Lagged.pool(diag_items).mean(), Lagged.pool(pair_items).mean())
-            record("dct", keep, 3.0 * keep * len(fit_set), distortion(pred, target))
-        log(f"  fold {held.name}: K={k_pc} captured={captured:.4f} comps={len(comps)} "
-            f"fit_iter={info['iterations']} rel_res={info['rel_residual']:.3g}")
+        fit_set = fold["fit_set"]
+        for keep in [int(k) for k in bcfg["dct_keep"] if int(k) < min(r.n_frames for r in fit_set)]:
+            items = [accel.dct_lagged(r.dx.reshape(r.n_frames, dim), keep, lags, pair_lags, rows_cols, n_res, segment)
+                     for r in fit_set]
+            pred = summarize(Lagged.pool([d for d, _ in items]).mean(), Lagged.pool([q for _, q in items]).mean())
+            fold["rows"].append(_row(fold, "dct", keep, 3.0 * keep * len(fit_set), distortion(pred, fold["target"])))
+        log(f"  fold {fold['held'].name}: K={k_pc} captured={fold['captured']:.4f} comps={len(fold['comps'])} "
+            f"fit_iter={info['iterations']} rel_res={info['rel_residual']:.3g} local_fits={len(residuals)} "
+            f"[{accel.info()['backend']}]")
 
     return {
         "bands_frames": bands.tolist(),
         "bands_ps": (bands * dt_ps).tolist(),
-        "rows": rows_out,
+        "rows": [row for fold in folds for row in fold["rows"]],
         "fits": fits,
     }
+
+
+def _row(fold: dict, method: str, param, params_per_res: float, metrics: dict, **extra) -> dict:
+    row = {"fold": fold["held"].name, "n_fit": len(fold["fit_set"]), "method": method, "param": param,
+           "params_per_res": params_per_res}
+    row.update(extra)
+    row.update(metrics)
+    return row

@@ -3,7 +3,7 @@
 # Every key not set here takes its default from src/flexcompress/config.py.
 name: stage01_atlas
 source: atlas
-archive_root: ${DYNAMODE_ATLAS_ARCHIVE}
+archive_root: ${DYNAMODE_ATLAS_ARCHIVE:-/projects/u6xq/hew/DATA/ATLAS/compressed_bb_zarr}
 split:
   file: DynaMode-dev/splits/ATLAS/atlas_train.csv
 

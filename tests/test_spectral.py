@@ -115,16 +115,17 @@ def test_rank_truncation_and_local_residual_reach_the_floor():
 
 
 def test_fit_batched_equals_individual():
+    """Per-element scaling: one batched solve == independent solves, even across 1000x scales."""
+
     rng = np.random.default_rng(5)
     lags = np.array([0, 1, 3, 9, 27])
     kern = kernel_matrix(BANDS[:4], 500, lags)
-    targets = np.stack([proj_psd(rng.standard_normal((len(lags), 3, 3))) for _ in range(4)], axis=1)
-    batched, _ = fit_psd_bands(targets, kern, max_iter=400, tol=1e-12, obj_tol=0)
-    for i in range(4):
-        single, _ = fit_psd_bands(targets[:, i] * (np.abs(targets[0]).max() / np.abs(targets[0, i]).max()),
-                                  kern, max_iter=400, tol=1e-12, obj_tol=0)
-        scale = np.abs(targets[0, i]).max() / np.abs(targets[0]).max()
-        np.testing.assert_allclose(batched[:, i], single * scale, atol=2e-3 * np.abs(batched).max())
+    scales = np.array([1.0, 1e-3, 30.0, 0.2])
+    targets = np.stack([s * proj_psd(rng.standard_normal((len(lags), 3, 3))) for s in scales], axis=1)
+    batched, _ = fit_psd_bands(targets, kern, max_iter=2000, tol=1e-12, obj_tol=0)
+    for i in range(len(scales)):
+        single, _ = fit_psd_bands(targets[:, i], kern, max_iter=2000, tol=1e-12, obj_tol=0)
+        np.testing.assert_allclose(batched[:, i], single, rtol=1e-6, atol=1e-8 * np.abs(single).max())
 
 
 def test_pca_exp_recovers_single_timescales():

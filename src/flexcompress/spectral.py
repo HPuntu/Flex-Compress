@@ -64,6 +64,13 @@ def proj_psd(matrix: np.ndarray) -> np.ndarray:
     return (v * w[..., None, :]) @ np.swapaxes(v, -1, -2)
 
 
+def _element_scale(sym: np.ndarray) -> np.ndarray:
+    """Per batch element max |C(0)|, shape (*batch, 1, 1); 1 where the element is zero."""
+
+    peak = np.abs(sym[0]).max(axis=(-2, -1), keepdims=True)
+    return np.where(peak > 0, peak, 1.0)
+
+
 def fit_psd_bands(
     targets: np.ndarray,
     kernels: np.ndarray,
@@ -78,7 +85,9 @@ def fit_psd_bands(
     """Solve min_A sum_l w_l ||sum_b K_lb A_b - C_l||_F^2,  A_b PSD.
 
     ``targets`` has shape (L, *batch, d, d) (symmetrised internally);
-    ``kernels`` (L, B).  Returns ``A`` with shape (B, *batch, d, d).
+    ``kernels`` (L, B).  Returns ``A`` with shape (B, *batch, d, d).  Batch
+    elements are independent problems sharing one ADMM run (rho and stopping
+    are global, each element is normalised by its own scale).
     ``init`` warm-starts from a previous solution of a similar problem
     (e.g. the local fit at the neighbouring rank).
 
@@ -97,7 +106,10 @@ def fit_psd_bands(
         raise ValueError("targets and kernels disagree on the number of lags")
     w = np.ones(n_lags) if weights is None else np.asarray(weights, dtype=np.float64)
     sym = 0.5 * (targets + np.swapaxes(targets, -1, -2))
-    scale = float(np.abs(sym[0]).max()) if np.abs(sym[0]).max() > 0 else 1.0
+    # Scale every batch element by its own lag-0 peak: a batched solve then gives
+    # each element the solution it would get alone (small residues converge as
+    # tightly as large ones), and many problems can share one GPU solve.
+    scale = _element_scale(sym)  # (*batch, 1, 1)
     sym = sym / scale
 
     gram = kernels.T @ (w[:, None] * kernels)
@@ -110,7 +122,7 @@ def fit_psd_bands(
     # where ADMM with residual-balanced rho converges ~10x faster than FISTA.
     rho = float(np.trace(gram)) / n_bands
     if init is not None and np.shape(init) == rhs.shape:
-        current = proj_psd(np.asarray(init, dtype=np.float64) / scale)
+        current = proj_psd(np.asarray(init, dtype=np.float64) / scale)  # broadcasts over bands
     else:
         current = proj_psd(np.tensordot(np.linalg.inv(gram), rhs, axes=(1, 0)))
     dual = np.zeros_like(current)

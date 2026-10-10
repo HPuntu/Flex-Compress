@@ -414,10 +414,14 @@ def aggregate(run_dir: str | Path, figures: bool = True) -> dict:
         labels = [f"{b:g}ps:{c}" for b in bands for c in ("xx", "yy", "zz", "xy", "xz", "yz")]
         uni[group] = universality([(k, d) for k, d, _ in entries], labels)
 
+    from .workqueue import progress
+
+    coverage = progress(run_dir, listing)
     summary = {
         "created": now_utc(),
         "run_dir": str(run_dir),
         "config_hash": cfg["run"]["config_hash"],
+        "coverage": coverage,
         "n_targets_configured": listing["n_targets"],
         "n_results": len(docs),
         "n_ok": len(ok),
@@ -439,7 +443,9 @@ def aggregate(run_dir: str | Path, figures: bool = True) -> dict:
             make_figures(report, stage0_rows, stage1_rows, summary)
         except ImportError as exc:
             print(f"figures skipped: {exc}")
-    print(f"aggregated {len(ok)}/{listing['n_targets']} targets ({len(errors)} errors) -> {report}")
+    print(f"aggregated {len(ok)}/{listing['n_targets']} targets ({len(errors)} errors"
+          + ("" if coverage["complete"] else f"; {coverage['remaining'] + coverage['running']} not finished yet")
+          + f") -> {report}")
     return summary
 
 

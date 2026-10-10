@@ -108,7 +108,7 @@ Both datasets are read from DynaMode-dev's **compressed all-backbone archives**:
 | 2 | Learned codec: set encoder over replica windows → per-residue + collective tokens, structure-conditioned decoder, cross-replica targets, rate sweep | next |
 | 3 | Predictability: structure + PLM embeddings → profile, scored as R² / noise ceiling by band and temperature; ENM / DynaProt / AlphaFlow / BioEmu / PLM-probe baselines; fold-level splits; mdCATH→ATLAS transfer | planned |
 
-Stage 0–1 run on **training splits only**. Validation and test proteins stay untouched for the predictability work.
+Stage 0–1 run on **the whole training split of each dataset**: all 1,266 ATLAS training chains (300 K) and all 4,304 mdCATH training domains at all five temperatures (21,520 targets). Validation and test proteins stay untouched for the predictability work.
 
 ### What Stage 0–1 computes (per domain × temperature)
 
@@ -169,54 +169,146 @@ Validated on synthetic OU mixtures with known spectra (`tests/`, 28 tests):
 
 ## 5. Running
 
-### Setup (cluster, once)
+The launchers default to **Isambard-AI** (project u6xq, `ssh u6xq.aip2.isambard`, root `/projects/u6xq/hew`). The Oxford HTC cluster is still supported with `FLEXC_SITE=htc`. Each site profile in `sbatch/sites/` holds that cluster's data and run paths, conda setup, per-job parallelism and Slurm requests. Every value can be overridden with an environment variable.
+
+| | Isambard-AI (default) | HTC (`FLEXC_SITE=htc`) |
+|---|---|---|
+| Archives | `/projects/u6xq/hew/DATA/{ATLAS,mdCATH}/compressed_bb_zarr` | `/data/stat-opig/$USER/DATA/{ATLAS,mdCATH}/compressed_bb_zarr` |
+| Runs | `/projects/u6xq/hew/flex-compress-runs` | `/data/stat-opig/$USER/DATA/flex-compress-runs` |
+| Conda | `/projects/u6xq/hew/miniforge3`; first env that activates: `$FLEXC_ENV`, `$DYNAMODE_ENV`, **`dynamode-gh200`**, `flexc` | `~/hpc_env.sh`; `$FLEXC_ENV`, `$DYNAMODE_ENV`, `dynamode-v100` |
+| One array task | `--nodes=1 --gpus=1`: one whole GH200 (72 Arm cores, ~115 GB, H100), 24 h | `--partition=long`, 4 CPUs, 24 GB, 24 h |
+| Inside a task | up to 32 proteins in flight × 2 BLAS threads, admitted by memory (95 GB host / 80 GB GPU); linear algebra on the shared H100 | 1 target × 4 threads, numpy |
+| Worker tasks per round (full / pilot) | 16 GH200s / 1 | 64 / 8 |
+| Rounds before a run stops on its own | 4 × 24 h | 6 × 24 h |
+
+Isambard-AI hands out whole superchips. Each task therefore does two things:
+
+- **CPU:** a pool of worker processes (`worker --jobs`, longest targets first) keeps the 72 Grace cores busy with archive decoding and bookkeeping.
+- **GPU:** each process sends its heavy linear algebra to the task's H100 (see *GPU acceleration* below).
+
+The relevant limits (BriCS docs) are: `workq` partition, 24 h walltime, at most 1,000 array tasks, 256 running jobs.
+
+### Setup (Isambard-AI, once)
 
 ```bash
-git clone --recurse-submodules <flex-compress-remote> Flex-Compress   # or: git submodule update --init
-cd Flex-Compress
-git -C DynaMode-dev checkout dev            # submodule tracks DynaMode-dev's dev branch
-conda activate dynamode-v100                # any DynaMode env: numpy, scipy, zarr<3, pyyaml, matplotlib
-export DYNAMODE_ATLAS_ARCHIVE=/data/stat-opig/$USER/DATA/ATLAS/compressed_bb_zarr
-export DYNAMODE_MDCATH_ARCHIVE=/data/stat-opig/$USER/DATA/mdCATH/compressed_bb_zarr
-PYTHONPATH=src:DynaMode-dev/src python -m pytest -q   # ~30 s, synthetic data only
+ssh u6xq.aip2.isambard
+cd /projects/u6xq/hew && git clone --recurse-submodules <flex-compress-remote> Flex-Compress
+cd Flex-Compress && git -C DynaMode-dev checkout dev      # submodule tracks DynaMode-dev's dev branch
+source /projects/u6xq/hew/miniforge3/bin/activate dynamode-gh200
+PYTHONPATH=src:DynaMode-dev/src python -m pytest -q      # ~1 min, synthetic data, includes torch-vs-numpy checks
+sbatch sbatch/bench.sbatch                                # GPU vs CPU timing + agreement on one GH200
+sbatch sbatch/bench.sbatch --throughput --devices cuda --jobs-list 8,16,32,48   # proteins/hour vs concurrency
 ```
 
-No torch is needed. Archives are read through `dynamode.dataloader.compressed_backbone`, which uses only numpy, scipy and zarr. If DynaMode's `trajectory_index.v2.json` exists under the archive root it is used; otherwise the requested archives are scanned directly.
+The launchers activate `dynamode-gh200` from the project Miniforge automatically. It needs numpy, scipy, zarr<3, numcodecs<0.16, pyyaml, matplotlib and CUDA PyTorch, all of which DynaMode already requires. `bash sbatch/setup_env.sh` builds a separate CPU-only `flexc` env if you ever need one (`FLEXC_TORCH=1` adds CUDA PyTorch). Archives are read through `dynamode.dataloader.compressed_backbone`, which uses only numpy, scipy and zarr. If DynaMode's `trajectory_index.v2.json` exists under an archive root it is used; otherwise the requested archives are scanned directly from the login node during `configure`. For mdCATH's 4,304 training domains on Lustre, that scan takes a few minutes.
 
-### Pilot, then full
+### Full training splits
 
 ```bash
-bash sbatch/submit.sh configs/stage01_atlas.yaml pilot      # 32 proteins evenly spaced in length, 8 shards
-bash sbatch/submit.sh configs/stage01_mdcath.yaml pilot     # 32 domains × 5 temperatures
-bash sbatch/submit.sh configs/stage01_atlas.yaml full       # 64 shards
-bash sbatch/submit.sh configs/stage01_mdcath.yaml full --set folds.max_folds=2   # halve stage-1 cost
+bash sbatch/submit_train.sh                                   # ATLAS + mdCATH training splits, 16 GH200s each
+bash sbatch/submit.sh configs/stage01_atlas.yaml              # one dataset (full split is the default)
+bash sbatch/submit.sh configs/stage01_atlas.yaml pilot        # optional smoke test: 32 proteins, 1 GH200
 ```
 
-`submit.sh` does four things:
+Each dataset's training split becomes one frozen run that keeps going until every target is done. Nothing needs sizing by hand.
+
+- **One shared queue.** The run has no fixed shards. Every worker task (one GH200) claims the largest target that is not finished and that no live worker holds, so all tasks stay busy until the split runs out and finish together. Claims are files under `$RUN/claims/`, created atomically. A claim whose worker stops refreshing it for 15 minutes is taken over.
+- **Rounds.** Each round is a worker array of `FLEXC_SHARDS` tasks plus a finalize job that runs after it. The finalize job records progress in `$RUN/rounds.json`, submits the next round while targets remain, and aggregates what is done so far into `report/`. A run stops after `FLEXC_MAX_ROUNDS` rounds, or as soon as a round neither completes nor fails a single target (something is wrong: check `logs/` and `errors/`).
+- **Walltime.** A worker starts a protein only if it is predicted to finish before the walltime. The prediction comes from the wall time per unit cost of proteins that worker has already finished. Workers therefore stop cleanly near 24 h and leave the rest of the split to the next round. Claims from a round that ended are voided by its finalize job, so nothing waits on them.
+- **Coverage.** `configure` records every split domain that yields no target, with the reason: no archive, too few replicas with enough frames, or inconsistent replicas. `report/summary.json` has a `coverage` block covering split domains, eligible targets, done, failed and not started. Check progress at any time with:
+
+```bash
+PYTHONPATH=$RUN/code/src python -m flexcompress.run status --run-dir $RUN
+```
+
+- **More GPUs.** `FLEXC_SHARDS` (worker tasks per round) sets how fast a split finishes, not whether it does. Set it at submission; later rounds keep it.
+
+`submit.sh` does five things:
 
 1. creates `$FLEXC_RUNS_ROOT/<config>-<mode>-<timestamp>/`;
-2. freezes the resolved config, the target list with cost-balanced shard assignments, provenance (git commits of both repos, package versions), and a code snapshot;
-3. submits a worker array;
-4. submits an aggregation job (`afterany`).
+2. freezes the resolved config, the target list, the coverage record, provenance (git commits of both repos, package versions), and a code snapshot;
+3. records the site choices (site, conda env, jobs × threads, memory budgets, rounds) in `site.env`, so workers, later rounds, resumes and re-aggregations match the submission (`FLEXC_*` variables set when resuming take precedence);
+4. submits round 1 (`launch.sh`): the worker array;
+5. submits that round's finalize job (`afterany`).
 
-Resources and partition are set through `FLEXC_*` variables (see the script header). Defaults: `long`, 4 CPUs, 24 GB, 24 h.
+Common overrides are listed in the header of `sbatch/submit.sh`: `FLEXC_SHARDS`, `FLEXC_MAX_ROUNDS`, `FLEXC_JOBS` / `FLEXC_THREADS`, `FLEXC_MEM_BUDGET_GB` / `FLEXC_GPU_MEM_BUDGET_GB`, `FLEXC_DEVICE`, `FLEXC_MPS`, `FLEXC_TIME`, `FLEXC_RUNS_ROOT`, `FLEXC_ENV`.
+
+### GPU acceleration
+
+`src/flexcompress/accel.py` provides a PyTorch backend for every heavy kernel, chosen per process by `compute.device` in the config, or by `worker --device` / `FLEXC_DEVICE`:
+
+| Setting | Meaning |
+|---|---|
+| `auto` | the H100 if torch sees a GPU, otherwise numpy |
+| `cuda` | force the GPU |
+| `numpy` | CPU reference |
+| `torch-cpu` | the torch code path on the CPU (tests) |
+
+The backend is not part of the result hash, so runs can be resumed on either. Each result records the backend it used under `compute`.
+
+| On the GPU | Kernel |
+|---|---|
+| windowed lagged covariance sums | batched matmuls (`bmm`) |
+| PC basis, pooled and backbone PCA, randomized SVD | `eigh` / `qr` / `svd` |
+| ADMM band fits, per-residue 3×3 (most of the CPU time) | cuSOLVER batched Jacobi `eigh` |
+| ADMM band fits, collective K×K (K up to 256) | **Newton–Schulz PSD projection** (matmuls only) |
+| subspace / per-band model predictions | `einsum` |
+| DCT baseline | projection onto an explicit orthonormal DCT-II basis |
+
+Archive decoding, metrics and aggregation stay on the CPU.
+
+**Why Newton–Schulz.** For matrices larger than 32×32, batched `torch.linalg.eigh` on CUDA falls back to solving one matrix at a time ([pytorch#175585](https://github.com/pytorch/pytorch/issues/175585)). That would make the GPU no faster than the Grace cores. The projection instead uses P₊(S) = (S + S·sign(S))/2, with sign(S) from 40 Newton–Schulz steps. Eigenvalues above ~10⁻⁶‖S‖ converge, and smaller ones contribute errors no larger than themselves, which ADMM tolerates. The final solution gets one exact eigendecomposition, so it is always PSD.
+
+**Agreement.** The tests check every kernel against numpy, and the whole pipeline on `torch-cpu`. With exact projections the backends agree to rounding: ADMM takes the same number of iterations, and Stage-1 metrics differ by about 10⁻¹⁴. With Newton–Schulz, Stage-1 metrics agree to about 10⁻³ or better.
+
+**Batched solves.** All statistics of a protein share one window length, so all folds share one kernel matrix. Per protein, Stage 1 therefore runs:
+
+- one batched ADMM solve for the collective fits of all folds, shape (B, folds, K, K);
+- one batched solve for the per-residue fits of every (fold, codec, rank), about 66 × N × B small 3×3 problems for ATLAS;
+- one batched solve for the descriptor fits of all replicas.
+
+Before, that was about 70 sequential small solves, each a long chain of tiny GPU kernels with a host synchronisation every iteration. Launches and synchronisations drop roughly 20×, and each launch carries enough work to occupy the H100. Each batch element is scaled separately, so a batched solve gives the same answer as solving each problem alone (tested across a 1000× spread of scales).
+
+**Speed.** On CPU the torch path is already about 1.3–1.4× faster than numpy. The H100 numbers have not been measured yet:
+
+- `sbatch sbatch/bench.sbatch` times one synthetic ATLAS-sized target on numpy and CUDA, and exits non-zero if they disagree by more than 1 %.
+- `--throughput` runs the real worker over 24 synthetic proteins (N = 80–400) at several concurrencies and prints proteins/hour. Pick `FLEXC_JOBS` from that curve.
+
+### Many proteins per GH200
+
+Throughput per GH200 is limited by memory, not cores, so the worker schedules by memory:
+
+- **Admission.** It estimates each protein's host and GPU footprint (decoded trajectories, backbone PCA working set, batched fit state, runtime and CUDA context). A protein starts only when its footprint fits the remaining budget.
+- **Defaults.** On Isambard: up to `FLEXC_JOBS=32` in flight, `FLEXC_MEM_BUDGET_GB=95` of ~115 GB, `FLEXC_GPU_MEM_BUDGET_GB=80` of 96 GB.
+- **Order.** Largest proteins go first. Small ones backfill while a large one waits. After 60 s the waiting protein's memory is reserved so it can't starve, and a protein larger than the whole budget runs alone.
+- **Crashes.** If a worker process is killed (for example for exceeding memory), the pool is rebuilt and the in-flight proteins are re-run one at a time. Only a protein that crashes on its own is reported failed, with a hint to lower `FLEXC_JOBS`.
+
+With 32 processes on one H100, kernels from different processes time-slice by default. `FLEXC_MPS=1` starts a CUDA MPS daemon inside each job so those kernels can run concurrently, and falls back to time-slicing if it can't start. Compare the two with:
+
+```bash
+sbatch sbatch/bench.sbatch --throughput --devices cuda --jobs-list 16,32,48
+FLEXC_MPS=1 sbatch sbatch/bench.sbatch --throughput --devices cuda --jobs-list 16,32,48
+```
+
+Then make the better setting the default in `sbatch/sites/isambard.sh`.
 
 **Rough cost.**
 
-- A synthetic 300-residue ATLAS-sized target (3 × 10,000 frames) took 4.5 minutes on 4 slow cloud cores with all codecs, with a 1.4 GB peak. About 85 % of that is Stage 1, mostly ADMM eigendecompositions.
-- Expect roughly 50–100 CPU-hours for the ATLAS training split.
-- mdCATH has 5 folds × 5 temperatures per domain at K = 128. Run the pilot, read the per-target `timing` in `results/`, and scale up; `folds.max_folds=2` halves the Stage 1 cost.
+- **CPU only:** a synthetic 300-residue ATLAS-sized target (3 × 10,000 frames) took 4.5 minutes on 4 slow cloud cores with all codecs, with a 1.4 GB peak. About 85 % of that is Stage 1, mostly ADMM eigendecompositions, which is the part the GPU backend takes over.
+- **ATLAS training split (1,266 targets):** roughly 50–100 CPU-hours (about 1–2 GH200-hours), less with the H100. On 16 GH200s it should take well under an hour once the jobs start.
+- **mdCATH training split (21,520 targets):** 5 folds per target at K = 128. By the same cost model the total is similar to ATLAS's, within a factor of a few. If it overruns one round, the next round continues it automatically. Each result records its `timing` and backend, and `report/summary.json` gives the timing distribution. `folds.max_folds=2` would halve Stage 1 cost, but it is not needed to fit the walltime any more.
+- **Memory:** proteins are admitted against 95 GB host / 80 GB GPU budgets, as described above. The worker log prints the budgets and the largest estimated footprint at start-up.
 
-**Resuming.** Workers skip targets that already have a result with the same configuration hash. `bash sbatch/resume.sh $RUN` (optionally with a shard list such as `3,17`) resubmits the array and re-aggregates. Failures are written to `$RUN/errors/` with tracebacks and listed in `summary.json`.
+**Failures and resuming.** A target that fails is written to `$RUN/errors/` with its traceback and listed in `summary.json`. A protein that kills its worker process even when running alone (usually out of memory) is recorded there too. Later rounds do not retry failures. Once a run has stopped, `bash sbatch/resume.sh $RUN` starts a new series of rounds that retries failures recorded before it was called and continues anything not yet done. It uses the run's frozen code and site settings, with `FLEXC_*` variables set now taking precedence (for example `FLEXC_JOBS=16` after out-of-memory kills). While jobs of the run are still queued or running it refuses, because the run continues on its own. `FLEXC_FORCE=1` overrides that; two series can run side by side safely because they share the queue.
 
-**Interactive or debug** (one process: configure, all shards, aggregate):
+**Interactive or debug** (one process: configure, work through every target, aggregate; use `--jobs` on a compute node):
 
 ```bash
 PYTHONPATH=src:DynaMode-dev/src python -m flexcompress.run local --config configs/stage01_atlas.yaml \
-    --run-dir /tmp/fc-debug --set "selection.domains=['6o2v_A','7ead_A']"
+    --run-dir /tmp/fc-debug --set "selection.domains=['6o2v_A','7ead_A']" --jobs 2
 ```
 
-Any setting can be overridden with `--set key.sub=value`. Unknown keys are rejected.
+Configs read the archive locations from `DYNAMODE_ATLAS_ARCHIVE` / `DYNAMODE_MDCATH_ARCHIVE` (exported by the site profile in `submit.sh`). If these are unset, they fall back to the Isambard paths. On HTC outside `submit.sh`, export them, or run `source sbatch/sites/htc.sh` (paths only; avoid sourcing `flexc_env.sh` in an interactive shell, since it sets `set -e`). Any setting can be overridden with `--set key.sub=value`; unknown keys are rejected.
 
 ### Outputs (`$RUN/report/`)
 
@@ -225,7 +317,7 @@ Any setting can be overridden with `--set key.sub=value`. Unknown keys are rejec
 | `stage0.csv` | one row per target: PCA counts, cosine content, RMSIP, drift, Q, floors, replica correlations, band reliability, asymmetry |
 | `stage1.csv` | one row per (target, fold, codec, rate): absolute and floor-normalised distortions |
 | `stage1_fits.csv` | fit diagnostics and the relaxation spectrum (variance fraction per band) per fold |
-| `summary.json` | grouped (source/temperature) medians and IQRs, rank-needed and N-scaling, full-model adequacy, reliability-vs-lag curves, universality |
+| `summary.json` | coverage of the split (eligible, done, failed, not started; exclusions are listed in `targets.json`), grouped (source/temperature) medians and IQRs, rank-needed and N-scaling, full-model adequacy, reliability-vs-lag curves, universality |
 | `figures/` | rate–distortion grid, rank needed vs N, PCA-90 vs N, reliability vs lag (by temperature), universality curve |
 
 Reading the replica-reliability numbers: anisotropy-shape correlations use the deviation from isotropy, because raw trace-normalised tensors correlate about 0.6–0.9 even when the two replicas share no anisotropy. `acf_horizon_ps` is the last lag before the median cross-replica correlation of per-residue autocorrelation first drops below 0.5.
@@ -248,7 +340,10 @@ Per-target JSON results are in `$RUN/results/`. Per-residue descriptors (with re
 
 ```
 configs/                    stage01_atlas.yaml, stage01_mdcath.yaml, stage01_atlas_1ns.yaml
-sbatch/                     submit.sh, resume.sh, worker.sbatch, aggregate.sbatch, flexc_env.sh
+sbatch/                     submit_train.sh (both training splits), submit.sh, resume.sh, launch.sh (one round),
+                            worker.sbatch, aggregate.sbatch (finalize a round), flexc_env.sh, setup_env.sh
+  sites/                    isambard.sh (default), htc.sh: paths, conda, device, parallelism, Slurm requests
+  bench.sbatch              GPU vs CPU benchmark on one GH200
 src/flexcompress/
   data.py                   archive discovery, splits, decoding via DynaMode-dev
   stats.py                  lag grids, exact replica-poolable lagged covariance sums
@@ -259,9 +354,13 @@ src/flexcompress/
   diagnostics.py            PCA counts, cosine content, RMSIP, native contacts, asymmetry
   frames.py                 structure-fixed residue frames
   pipeline.py               per-target Stage 0, descriptors, Stage 1
-  run.py                    configure / worker / aggregate / local CLI
+  run.py                    configure / worker / status / aggregate / local CLI
+  workqueue.py              shared queue: atomic claims, heartbeats, takeover, walltime-aware admission
   aggregate.py, report.py   tables, summaries, universality, figures
   synthetic.py              OU-mixture ground truth written as DynaMode archives (tests)
+  accel.py                  optional PyTorch/CUDA backend for the heavy kernels
+  scheduler.py              memory-aware admission of proteins into the worker pool
+  bench.py                  backend timing/agreement benchmark (`run bench`)
 tests/                      unit + end-to-end tests on synthetic archives
 DynaMode-dev/               read-only submodule (dev branch)
 ```

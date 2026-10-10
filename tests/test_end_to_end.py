@@ -1,6 +1,11 @@
 """Archive round trip and the full configure -> worker -> aggregate pipeline."""
 
 import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -161,6 +166,222 @@ def test_unequal_replica_lengths_share_one_window(tmp_path):
     floors = {r["fold"]: r for r in result["stage1"]["rows"] if r["method"] == "floor"}
     ratios = [r["msf_rel"] / floors[r["fold"]]["msf_rel"] for r in full]
     assert len(ratios) == 4 and 0.4 < float(np.median(ratios)) < 1.6
+
+
+def test_parallel_worker_matches_sequential(archive_root, tmp_path):
+    """`worker --jobs` (spawned processes, as on an Isambard GH200) gives the sequential results."""
+
+    cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A", "2xyz_B", "3pqr_C"])
+    seq, par = tmp_path / "seq", tmp_path / "par"
+    for run_dir in (seq, par):
+        assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir)]) == 0
+    assert run.main(["worker", "--run-dir", str(seq), "--all", "--threads", "1"]) == 0
+    assert run.main(["worker", "--run-dir", str(par), "--all", "--jobs", "3", "--threads", "1"]) == 0
+    for key in ("1abc_A__T300", "2xyz_B__T300", "3pqr_C__T300"):
+        a = json.loads((seq / "results" / "atlas" / f"{key}.json").read_text())
+        b = json.loads((par / "results" / "atlas" / f"{key}.json").read_text())
+        assert a["status"] == b["status"] == "ok"
+        rows_a = {(r["fold"], r["method"], r["param"]): r for r in a["stage1"]["rows"]}
+        rows_b = {(r["fold"], r["method"], r["param"]): r for r in b["stage1"]["rows"]}
+        assert rows_a.keys() == rows_b.keys()
+        for k, r in rows_a.items():
+            np.testing.assert_allclose(r["frob_rel"], rows_b[k]["frob_rel"], rtol=1e-6, atol=1e-9)
+
+
+def test_torch_backend_worker_matches_numpy(archive_root, tmp_path):
+    """Whole pipeline on the torch backend (as on the GPU), incl. forced Newton-Schulz projections."""
+
+    pytest.importorskip("torch")
+    cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A", "2xyz_B"])
+    runs = {}
+    for name, extra in (("numpy", []), ("torch", []), ("ns", ["--set", "compute.psd_method=newton_schulz"])):
+        run_dir = tmp_path / f"run_{name}"
+        assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir), *extra]) == 0
+        device = "numpy" if name == "numpy" else "torch-cpu"
+        jobs = "2" if name == "torch" else "1"
+        assert run.main(["worker", "--run-dir", str(run_dir), "--all", "--device", device, "--jobs", jobs,
+                         "--threads", "1"]) == 0
+        runs[name] = run_dir
+    for key in ("1abc_A__T300", "2xyz_B__T300"):
+        docs = {n: json.loads((d / "results" / "atlas" / f"{key}.json").read_text()) for n, d in runs.items()}
+        assert docs["torch"]["compute"]["backend"] == "torch:cpu"
+        assert docs["numpy"]["config_hash"] == docs["torch"]["config_hash"] == docs["ns"]["config_hash"]
+        ref = {(r["fold"], r["method"], r["param"]): r for r in docs["numpy"]["stage1"]["rows"]}
+        for name, rtol in (("torch", 1e-6), ("ns", 2e-2)):
+            for r in docs[name]["stage1"]["rows"]:
+                a = ref[(r["fold"], r["method"], r["param"])]
+                np.testing.assert_allclose(r["frob_rel"], a["frob_rel"], rtol=rtol, atol=1e-9, err_msg=name)
+                np.testing.assert_allclose(r["msf_rel"], a["msf_rel"], rtol=rtol, atol=1e-6, err_msg=name)
+        s0n, s0t = docs["numpy"]["stage0"], docs["torch"]["stage0"]
+        assert s0n["ca_pca_pooled"] == s0t["ca_pca_pooled"]
+        np.testing.assert_allclose(s0t["floor_pairwise"]["frob_rel"], s0n["floor_pairwise"]["frob_rel"], rtol=1e-8)
+
+
+def _status(run_dir, *extra):
+    """Run `status` and return its last stdout line."""
+
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert run.main(["status", "--run-dir", str(run_dir), *extra]) == 0
+    return buf.getvalue().strip().splitlines()[-1]
+
+
+def test_full_split_shared_by_concurrent_workers(tmp_path):
+    """Whole split: coverage record, two workers at once never duplicate, rounds continue to the end."""
+
+    root = tmp_path / "arch"
+    ids = ["5aaa_A", "5bbb_A", "5ccc_A", "5ddd_A"]
+    for i, domain in enumerate(ids):
+        native, traj = make_protein(8 + i, 3, 300, 40 + i)
+        write_archive(root, "atlas", domain, native, traj, frame_interval_ps=10.0, chunk_frames=128)
+    native, traj = make_protein(8, 1, 300, 50)  # a single replica: excluded, with the reason recorded
+    write_archive(root, "atlas", "6one_A", native, traj, frame_interval_ps=10.0, chunk_frames=128)
+    cfg_path = small_config(tmp_path, root, "atlas", [*ids, "6one_A", "missing_Z"])
+    run_dir = tmp_path / "run_full"
+    assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir), "--shards", "2",
+                     "--set", "folds.max_folds=1", "--set", "baselines.dct_keep=[8]"]) == 0
+    listing = json.loads((run_dir / "targets.json").read_text())
+    cov = listing["coverage"]
+    assert listing["n_targets"] == 4 and listing["missing_domains"] == ["missing_Z"]
+    assert (run_dir / "launch.sh").is_file() and (run_dir / "aggregate.sbatch").is_file()
+    assert cov["mode"] == "full" and cov["n_split_domains"] == 6 and cov["n_domains_with_archive"] == 5
+    assert [(e["domain"], e["reason"]) for e in cov["excluded_targets"]] == [("6one_A", "too_few_replicas")]
+
+    repo = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": f"{repo / 'src'}{os.pathsep}{repo / 'DynaMode-dev' / 'src'}"}
+    env.pop("SLURM_JOB_ID", None)
+    procs = [subprocess.Popen([sys.executable, "-m", "flexcompress.run", "worker", "--run-dir", str(run_dir),
+                               "--shard", str(i), "--device", "numpy", "--threads", "1"],
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+             for i in range(2)]
+    logs = [p.communicate(timeout=600)[0] for p in procs]
+    assert all(p.returncode == 0 for p in procs), logs
+    starts = [line.split()[3].rstrip(":") for log in logs for line in log.splitlines() if ": start N=" in line]
+    assert sorted(starts) == sorted(f"{d}__T300" for d in ids), logs  # each target exactly once
+    assert not list((run_dir / "claims").glob("*.claim"))
+    assert json.loads(_status(run_dir))["done"] == 4
+    assert _status(run_dir, "--round", "1") == "action=finished"
+
+    # Rounds: lose two results (as if a round hit the walltime), then continue until finished.
+    for d in ids[:2]:
+        (run_dir / "results" / "atlas" / f"{d}__T300.json").unlink()
+    (run_dir / "rounds.json").unlink()
+    assert _status(run_dir, "--round", "1", "--max-rounds", "3") == "action=resubmit"  # 2 done > 0
+    assert _status(run_dir, "--round", "2", "--max-rounds", "3") == "action=stalled"  # no progress
+    assert _status(run_dir, "--round", "3", "--max-rounds", "3") == "action=max_rounds"
+    # Progress is done + failed per series: a round that only records failures is not stalled.
+    _status(run_dir, "--round", "0", "--series", "f")
+    err_fake = run_dir / "errors" / "atlas" / f"{ids[1]}__T300.json"
+    err_fake.parent.mkdir(parents=True, exist_ok=True)
+    err_fake.write_text(json.dumps({"target": {"domain_id": ids[1], "temperature": "300"}, "error": "x"}))
+    assert _status(run_dir, "--round", "1", "--series", "f") == "action=resubmit"
+    assert _status(run_dir, "--round", "1", "--series", "g") == "action=resubmit"  # no baseline: vs 0
+    assert _status(run_dir, "--round", "2", "--series", "f") == "action=stalled"
+    history = json.loads((run_dir / "rounds.json").read_text())
+    assert [h["series"] for h in history][-4:] == ["f", "f", "g", "f"]
+    err_fake.unlink()
+
+    # A claim left by an array that has ended blocks nothing once the finalize job records it.
+    claim = run_dir / "claims" / f"{ids[0]}__T300.claim"
+    claim.write_text(json.dumps({"job": "777", "token": "gone"}))
+    assert json.loads(_status(run_dir))["running"] == 1
+    assert json.loads(_status(run_dir, "--dead-job", "777"))["running"] == 0
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy"]) == 0
+    assert _status(run_dir, "--round", "4", "--max-rounds", "9") == "action=finished"
+
+    # Failures are recorded, not retried by later rounds, and retried on request (resume).
+    broken = root / "domains" / f"atlas_backbone_{ids[3]}.zarr.zip"
+    broken.write_bytes(b"not a zip")
+    (run_dir / "results" / "atlas" / f"{ids[3]}__T300.json").unlink()
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy"]) == 0
+    err = run_dir / "errors" / "atlas" / f"{ids[3]}__T300.json"
+    first = err.stat().st_mtime_ns
+    prog = json.loads(_status(run_dir))
+    assert prog["failed"] == 1 and prog["remaining"] == 0 and prog["complete"]
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy"]) == 0
+    assert err.stat().st_mtime_ns == first
+    time.sleep(0.01)
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy", "--retry-failed"]) == 0
+    second = err.stat().st_mtime_ns
+    assert second > first
+    # resume.sh gives every task one cutoff: failures recorded after it are not retried again.
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy",
+                     "--retry-since", str(time.time() - 3600)]) == 0
+    assert err.stat().st_mtime_ns == second
+
+
+def test_target_failed_elsewhere_is_not_rerun(archive_root, tmp_path, monkeypatch):
+    """A target another worker failed on after this worker's scan is skipped, not run again."""
+
+    cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A", "2xyz_B"])
+    run_dir = tmp_path / "run_elsewhere"
+    assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir)]) == 0
+    calls = []
+
+    def fake(run_dir_, cfg, target, tag):
+        calls.append(target.key)
+        other = "1abc_A__T300" if target.key == "2xyz_B__T300" else "2xyz_B__T300"
+        err = run_dir_ / "errors" / "atlas" / f"{other}.json"  # "another worker" fails on the other one
+        err.parent.mkdir(parents=True, exist_ok=True)
+        err.write_text(json.dumps({"target": {"domain_id": other.split("__")[0], "temperature": "300"},
+                                   "error": "elsewhere"}))
+        out = run_dir_ / "results" / "atlas" / f"{target.key}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"status": "ok"}))
+        return target.key, "ok", 0.1, None
+
+    monkeypatch.setattr(run, "_process_one", fake)
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy"]) == 0
+    assert len(calls) == 1
+
+
+def test_worker_stops_before_the_walltime(archive_root, tmp_path):
+    cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A", "2xyz_B"])
+    run_dir = tmp_path / "run_deadline"
+    assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir)]) == 0
+    # 5 minutes left: too little to start a target before any runtime is known.
+    assert run.main(["worker", "--run-dir", str(run_dir), "--deadline", str(time.time() + 300)]) == 0
+    prog = json.loads(_status(run_dir))
+    assert prog["done"] == 0 and prog["remaining"] == 2 and not list((run_dir / "claims").glob("*.claim"))
+
+
+def test_bench_command(tmp_path):
+    pytest.importorskip("torch")
+    code = run.main(["bench", "--devices", "numpy,torch-cpu", "--n-res", "12", "--frames", "600",
+                     "--workdir", str(tmp_path), "--set", "spectral.pc_max=24",
+                     "--set", "spectral.ranks=[0,2,8]", "--set", "baselines.dct_keep=[8]"])
+    assert code == 0
+    summary = json.loads((tmp_path / "bench.json").read_text())
+    assert [r["backend"] for r in summary["runs"]] == ["numpy", "torch:cpu"]
+    assert summary["max_relative_difference"] < 1e-6
+
+
+def test_bench_throughput_mode(tmp_path):
+    code = run.main(["bench", "--throughput", "--devices", "numpy", "--jobs-list", "1,3", "--proteins", "4",
+                     "--n-res-range", "8,14", "--frames", "400", "--threads", "1", "--workdir", str(tmp_path),
+                     "--set", "spectral.pc_max=24", "--set", "spectral.ranks=[0,2]", "--set", "baselines.dct_keep=[8]",
+                     "--set", "diagnostics.bb_pca=false", "--set", "min_frames=50"])
+    assert code == 0
+    rows = json.loads((tmp_path / "throughput.json").read_text())["rows"]
+    assert [(r["jobs"], r["done"], r["failed"]) for r in rows] == [(1, 4, 0), (3, 4, 0)]
+    assert all(r["proteins_per_hour"] > 0 for r in rows)
+
+
+def test_isambard_archive_defaults(monkeypatch, tmp_path):
+    from flexcompress.config import load_config, resolve_config
+
+    monkeypatch.delenv("DYNAMODE_ATLAS_ARCHIVE", raising=False)
+    monkeypatch.delenv("DYNAMODE_MDCATH_ARCHIVE", raising=False)
+    root = run.REPO_ROOT
+    atlas = resolve_config(load_config(root / "configs" / "stage01_atlas.yaml"), root)
+    mdcath = resolve_config(load_config(root / "configs" / "stage01_mdcath.yaml"), root)
+    assert atlas["archive_root"] == "/projects/u6xq/hew/DATA/ATLAS/compressed_bb_zarr"
+    assert mdcath["archive_root"] == "/projects/u6xq/hew/DATA/mdCATH/compressed_bb_zarr"
+    monkeypatch.setenv("DYNAMODE_ATLAS_ARCHIVE", str(tmp_path))
+    assert resolve_config(load_config(root / "configs" / "stage01_atlas.yaml"), root)["archive_root"] == str(tmp_path)
 
 
 def test_config_rejects_unknown_keys(tmp_path):

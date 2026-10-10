@@ -19,14 +19,14 @@ __all__ = ["DEFAULTS", "SOURCE_DEFAULTS", "load_config", "resolve_config"]
 
 SOURCE_DEFAULTS = {
     "atlas": {
-        "archive_root": "${DYNAMODE_ATLAS_ARCHIVE}",
+        "archive_root": "${DYNAMODE_ATLAS_ARCHIVE:-/projects/u6xq/hew/DATA/ATLAS/compressed_bb_zarr}",  # Isambard default
         "split_file": "DynaMode-dev/splits/ATLAS/atlas_train.csv",
         "nominal_interval_ps": 10.0,
         "nominal_frames": 10000,
         "temperatures": None,
     },
     "mdcath": {
-        "archive_root": "${DYNAMODE_MDCATH_ARCHIVE}",
+        "archive_root": "${DYNAMODE_MDCATH_ARCHIVE:-/projects/u6xq/hew/DATA/mdCATH/compressed_bb_zarr}",  # Isambard default
         "split_file": "DynaMode-dev/splits/mdCATH/train_ids.txt",
         "nominal_interval_ps": 1000.0,
         "nominal_frames": 500,
@@ -98,6 +98,10 @@ DEFAULTS: dict = {
         "eps_A2": 1.0e-4,
     },
     "stages": {"stage0": True, "stage1": True},
+    # Compute backend (not part of the result hash: devices agree to rounding).
+    # device: auto (CUDA if torch sees a GPU, else numpy) | numpy | cuda | cuda:N | torch-cpu
+    # psd_method: auto (Newton-Schulz for >32x32 on CUDA, eigh otherwise) | eigh | newton_schulz
+    "compute": {"device": "auto", "dtype": "float64", "psd_method": "auto", "ns_iters": 40},
     "aggregate": {"rank_threshold": [1.0, 1.1], "bootstrap": 1000},
     "seed": 20261009,
 }

@@ -3,7 +3,7 @@
 # Only 100 frames per replica remain, so lags/bands are short and coarse.
 name: stage01_atlas_1ns
 source: atlas
-archive_root: ${DYNAMODE_ATLAS_ARCHIVE}
+archive_root: ${DYNAMODE_ATLAS_ARCHIVE:-/projects/u6xq/hew/DATA/ATLAS/compressed_bb_zarr}
 split:
   file: DynaMode-dev/splits/ATLAS/atlas_train.csv
 frame_interval_ps: 1000
