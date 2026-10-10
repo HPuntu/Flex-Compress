@@ -1,0 +1,24 @@
+# Stage 0-1 on mdCATH: 5 temperatures x 5 replicas, mostly 500 ns at 1 ns.
+# Targets are (domain, temperature).  413/450 K include unfolding: stage-0
+# native-contact, drift and irreversibility diagnostics flag non-stationary runs.
+name: stage01_mdcath
+source: mdcath
+archive_root: ${DYNAMODE_MDCATH_ARCHIVE}
+split:
+  file: DynaMode-dev/splits/mdCATH/train_ids.txt
+temperatures: ["320", "348", "379", "413", "450"]
+
+stats:
+  n_lags: 12               # lag 0 + log grid up to 50 ns
+  max_lag_fraction: 0.1
+
+spectral:
+  bands_per_decade: 2      # sub-frame (<1 ns, aggregate) + 1 ns ... 250 ns
+  pc_max: 128              # 4 x 500 frames per fit: PCs beyond ~128 are noise; 8x cheaper fits
+  ranks: [0, 1, 2, 4, 8, 16, 32, 64, 128]
+
+baselines:
+  dct_keep: [8, 32, 128]
+
+folds:
+  max_folds: null          # 5 leave-one-replica-out folds; set 2 to halve stage-1 cost

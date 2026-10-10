@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flex-compress"
+version = "0.1.0"
+description = "How compressible and how predictable are protein dynamics? Stage 0-1 empirical study on mdCATH and ATLAS."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Hew Phipps" }]
+# Runs inside the DynaMode conda env; data access uses the DynaMode-dev
+# submodule (put DynaMode-dev/src on PYTHONPATH, as the sbatch scripts do).
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "zarr>=2.16,<3",
+  "numcodecs>=0.11,<0.16",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+report = ["matplotlib>=3.7"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["flexcompress*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "DynaMode-dev/src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "E741", "B905"]

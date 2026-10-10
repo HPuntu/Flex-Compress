@@ -1,0 +1,4 @@
+[submodule "DynaMode-dev"]
+	path = DynaMode-dev
+	url = git@github.com:HPuntu/DynaMode-dev.git
+	branch = dev

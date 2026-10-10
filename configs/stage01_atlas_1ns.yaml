@@ -1,0 +1,17 @@
+# ATLAS viewed at mdCATH's 1 ns spacing (stored stride-100 sampling view):
+# the matched-sampling comparison for cross-dataset transfer (Stage 3 prep).
+# Only 100 frames per replica remain, so lags/bands are short and coarse.
+name: stage01_atlas_1ns
+source: atlas
+archive_root: ${DYNAMODE_ATLAS_ARCHIVE}
+split:
+  file: DynaMode-dev/splits/ATLAS/atlas_train.csv
+frame_interval_ps: 1000
+min_frames: 50
+
+stats:
+  n_lags: 8
+  max_lag_fraction: 0.2
+
+baselines:
+  dct_keep: [8, 32]

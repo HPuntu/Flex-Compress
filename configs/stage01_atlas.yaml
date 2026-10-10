@@ -1,0 +1,24 @@
+# Stage 0-1 on ATLAS: 300 K, 3 x 100 ns replicas at 10 ps (full resolution).
+# Training split only; validation/test stay untouched for the predictability stage.
+# Every key not set here takes its default from src/flexcompress/config.py.
+name: stage01_atlas
+source: atlas
+archive_root: ${DYNAMODE_ATLAS_ARCHIVE}
+split:
+  file: DynaMode-dev/splits/ATLAS/atlas_train.csv
+
+stats:
+  n_lags: 16               # lag 0 + log grid up to 10% of T (10 ns at 10 ps)
+  max_lag_fraction: 0.1
+  pair_max_residues: 128   # coupling metrics on an evenly spaced residue subset
+  n_pair_lags: 6
+
+spectral:
+  bands_per_decade: 2      # relaxation bands: sub-frame + 10 ps ... 50 ns
+  pc_max: 256
+  ranks: [0, 1, 2, 4, 8, 16, 32, 64, 128, 256]
+  codecs: [subspace_local, subspace, band_local]
+
+baselines:
+  pca_exp_ranks: [1, 2, 4, 8, 16, 32, 64, 128]
+  dct_keep: [8, 32, 128, 512, 2048]
