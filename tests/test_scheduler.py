@@ -128,3 +128,10 @@ def test_adaptive_gpu_footprints_learn_from_peaks_and_ooms():
     assert abs(sizes.factor - 4.6875) < 1e-12
     sizes.observe("d", 2.0)  # small peaks never lower it below the post-OOM floor
     assert abs(sizes.factor - 4.6875) < 1e-12
+
+
+def test_adaptive_factor_is_capped():
+    sizes = AdaptiveFootprints({"a": Footprint(1.0, 1.0)}, factor=4.0)
+    for _ in range(20):
+        sizes.out_of_memory()
+    assert sizes.factor == 16.0

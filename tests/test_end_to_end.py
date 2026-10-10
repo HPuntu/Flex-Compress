@@ -194,7 +194,8 @@ def test_torch_backend_worker_matches_numpy(archive_root, tmp_path):
     pytest.importorskip("torch")
     cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A", "2xyz_B"])
     runs = {}
-    for name, extra in (("numpy", []), ("torch", []), ("ns", ["--set", "compute.psd_method=newton_schulz"])):
+    for name, extra in (("numpy", []), ("torch", []), ("ns", ["--set", "compute.psd_method=newton_schulz"]),
+                        ("jacobi", ["--set", "compute.psd_method=jacobi"])):
         run_dir = tmp_path / f"run_{name}"
         assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir), *extra]) == 0
         device = "numpy" if name == "numpy" else "torch-cpu"
@@ -206,8 +207,9 @@ def test_torch_backend_worker_matches_numpy(archive_root, tmp_path):
         docs = {n: json.loads((d / "results" / "atlas" / f"{key}.json").read_text()) for n, d in runs.items()}
         assert docs["torch"]["compute"]["backend"] == "torch:cpu"
         assert docs["numpy"]["config_hash"] == docs["torch"]["config_hash"] == docs["ns"]["config_hash"]
+        assert docs["jacobi"]["config_hash"] == docs["numpy"]["config_hash"]
         ref = {(r["fold"], r["method"], r["param"]): r for r in docs["numpy"]["stage1"]["rows"]}
-        for name, rtol in (("torch", 1e-6), ("ns", 2e-2)):
+        for name, rtol in (("torch", 1e-6), ("jacobi", 1e-6), ("ns", 2e-2)):
             for r in docs[name]["stage1"]["rows"]:
                 a = ref[(r["fold"], r["method"], r["param"])]
                 np.testing.assert_allclose(r["frob_rel"], a["frob_rel"], rtol=rtol, atol=1e-9, err_msg=name)
@@ -361,6 +363,28 @@ def test_gpu_out_of_memory_is_retried_alone_then_on_cpu(archive_root, tmp_path, 
     assert calls == [{}, {"gpu_retry": 1}, {"gpu_retry": 2, "device": "numpy"}]
     assert (run_dir / "results" / "atlas" / "1abc_A__T300.json").is_file()
     assert not (run_dir / "errors").exists() or not list((run_dir / "errors").rglob("*.json"))
+
+
+def test_request_larger_than_the_gpu_goes_straight_to_cpu(archive_root, tmp_path, monkeypatch):
+    from flexcompress import accel
+
+    cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A"])
+    run_dir = tmp_path / "run_huge"
+    assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir),
+                     "--set", "folds.max_folds=1"]) == 0
+    real, calls = run.process_target, []
+
+    def huge(target, cfg, log=print):
+        calls.append(dict(target.extra))
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 162.79 GiB.")
+        return real(target, cfg, log=log)
+
+    monkeypatch.setattr(run, "process_target", huge)
+    monkeypatch.setattr(accel, "is_gpu_memory_error", lambda exc: "out of memory" in str(exc))
+    monkeypatch.setattr(accel, "request_exceeds_device", lambda exc: True)
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy"]) == 0
+    assert calls == [{}, {"gpu_retry": 2, "device": "numpy"}]
 
 
 def test_systematic_failures_stop_the_worker_and_the_rounds(archive_root, tmp_path, monkeypatch):

@@ -147,6 +147,18 @@ def is_gpu_memory_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _GPU_MEMORY_MARKERS)
 
 
+def request_exceeds_device(exc: BaseException) -> bool:
+    """True if a CUDA OOM message asked for more than the GPU's total memory."""
+
+    import re
+
+    match = re.search(r"Tried to allocate ([0-9.]+) (GiB|MiB)", str(exc))
+    if not match or not on_gpu():
+        return False
+    size = float(match.group(1)) * (2**30 if match.group(2) == "GiB" else 2**20)
+    return size > _S["torch"].cuda.get_device_properties(_S["device"]).total_memory
+
+
 def reset_peak() -> None:
     if on_gpu():
         _S["torch"].cuda.reset_peak_memory_stats(_S["device"])
@@ -333,11 +345,73 @@ def top_pcs(centered: np.ndarray, k: int, *, exact_max_dim: int = 3000, oversamp
 # --------------------------------------------------------------------------- ADMM band fit
 
 
-def _proj_exact(z):
+EIGH_CHUNK = 4096  # matrices per batched eigh call on CUDA (bounds cuSOLVER workspace)
+JACOBI_MAX_DIM = 4
+JACOBI_SWEEPS = 8
+
+
+def _eigh(sym):
+    """Batched eigh; on CUDA in bounded chunks.
+
+    cuSOLVER's batched solver sizes its workspace with the whole batch, and for
+    the hundreds of thousands of matrices of a stage-1 local fit it asked for
+    more memory than the GPU has (100-360 GB for one protein).
+    """
+
     torch = _S["torch"]
+    batch = sym.shape[:-2]
+    count = int(np.prod(batch)) if batch else 1
+    if _S["device"].type != "cuda" or count <= EIGH_CHUNK:
+        return torch.linalg.eigh(sym)
+    flat = sym.reshape(count, *sym.shape[-2:])
+    ws, vs = zip(*(torch.linalg.eigh(flat[i : i + EIGH_CHUNK]) for i in range(0, count, EIGH_CHUNK)))
+    return torch.cat(ws).reshape(*batch, -1), torch.cat(vs).reshape(sym.shape)
+
+
+def _jacobi_eigh(sym, sweeps: int = JACOBI_SWEEPS):
+    """Batched cyclic Jacobi for small symmetric matrices: elementwise ops and tiny matmuls only.
+
+    No solver library and no workspace; converges quadratically, so a few
+    sweeps reach rounding error for 3x3.  Returns (eigenvalues, eigenvectors)
+    like ``torch.linalg.eigh`` (unsorted, which the PSD projection does not need).
+    """
+
+    torch = _S["torch"]
+    n = sym.shape[-1]
+    a = sym.clone()
+    eye = torch.eye(n, dtype=sym.dtype, device=sym.device)
+    v = eye.expand_as(a).clone()
+    pairs = [(p, q) for p in range(n - 1) for q in range(p + 1, n)]
+    for _ in range(int(sweeps)):
+        for p, q in pairs:
+            apq = a[..., p, q]
+            app, aqq = a[..., p, p], a[..., q, q]
+            nonzero = apq != 0
+            theta = (aqq - app) / torch.where(nonzero, 2.0 * apq, torch.ones_like(apq))
+            t = torch.sign(theta) / (theta.abs() + torch.sqrt(theta * theta + 1.0))
+            t = torch.where(nonzero & torch.isfinite(t), t, torch.zeros_like(t))
+            t = torch.where(theta == 0, torch.where(nonzero, torch.ones_like(t), t), t)
+            c = 1.0 / torch.sqrt(t * t + 1.0)
+            sn = t * c
+            rot = eye.expand_as(a).clone()
+            rot[..., p, p] = c
+            rot[..., q, q] = c
+            rot[..., p, q] = sn
+            rot[..., q, p] = -sn
+            a = rot.transpose(-1, -2) @ a @ rot
+            v = v @ rot
+    return torch.diagonal(a, dim1=-2, dim2=-1), v
+
+
+def _proj_exact(z):
     sym = 0.5 * (z + z.transpose(-1, -2))
-    w, v = torch.linalg.eigh(sym)
-    return (v * w.clamp_min(0.0).unsqueeze(-2)) @ v.transpose(-1, -2)
+    small = sym.shape[-1] <= JACOBI_MAX_DIM
+    if small and (_S["psd_method"] == "jacobi" or _S["device"].type == "cuda"):
+        w, v = _jacobi_eigh(sym)
+    else:
+        w, v = _eigh(sym)
+    out = (v * w.clamp_min(0.0).unsqueeze(-2)) @ v.transpose(-1, -2)
+    return 0.5 * (out + out.transpose(-1, -2))
 
 
 def _proj_newton_schulz(z, iters: int):
@@ -362,7 +436,7 @@ def _use_newton_schulz(dim: int) -> bool:
     method = _S["psd_method"]
     if method == "newton_schulz":
         return True
-    if method == "eigh":
+    if method in ("eigh", "jacobi"):
         return False
     return _S["device"].type == "cuda" and dim > 32
 

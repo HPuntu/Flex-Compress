@@ -111,14 +111,15 @@ class AdaptiveFootprints:
     unknown factor.  GPU estimates are multiplied by ``factor``, which starts
     conservative, is recalibrated from observed peaks (1.25 x the largest
     observed/estimated ratio once three targets have finished), and is raised
-    1.5x whenever a target still runs out of GPU memory; it never drops below
-    a value set by such an increase.
+    1.5x whenever a target still runs out of GPU memory (at most x16); it never
+    drops below a value set by such an increase.
     """
 
     def __init__(self, base: dict | None = None, factor: float = 4.0):
         self.base: dict = dict(base or {})
         self.factor = float(factor)
         self.floor = 1.0
+        self.max_factor = 16.0  # beyond this the estimate is not the problem
         self.ratios: list[float] = []
 
     def __getitem__(self, key) -> Footprint:
@@ -137,10 +138,10 @@ class AdaptiveFootprints:
             return
         self.ratios.append(peak_gb / fp.gpu_gb)
         if len(self.ratios) >= 3:
-            self.factor = max(self.floor, 1.25 * max(self.ratios))
+            self.factor = min(max(self.floor, 1.25 * max(self.ratios)), self.max_factor)
 
     def out_of_memory(self) -> None:
-        self.floor = self.factor = self.factor * 1.5
+        self.floor = self.factor = min(self.factor * 1.5, self.max_factor)
 
 
 def run_admitted(make_executor, func, tasks: list, footprints: dict, jobs: int, host_budget_gb: float,

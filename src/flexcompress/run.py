@@ -261,7 +261,10 @@ def _process_one(run_dir: Path, cfg: dict, target, tag: str) -> tuple:
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}".split("\n", 1)[0]
         if accel.is_gpu_memory_error(exc):
-            return target.key, GPU_RETRY, time.monotonic() - started, message, {}
+            # Where it happened, for diagnosis (the failure itself is not recorded).
+            log(f"{tag} {target.key}: GPU memory error at\n" + "".join(traceback.format_exc(limit=-4)))
+            return target.key, GPU_RETRY, time.monotonic() - started, message, {
+                "larger_than_gpu": accel.request_exceeds_device(exc)}
         atomic_write_json(err_json, {
             "target": target.to_dict(), "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(), "time": now_utc(), "compute": accel.info(),
@@ -380,10 +383,13 @@ def worker(args) -> int:
         info = outcome[4] if len(outcome) > 4 else {}
         if status == GPU_RETRY:
             stage = int(target.extra.get("gpu_retry", 0)) + 1
-            sizes.out_of_memory()
-            log(f"{key}: GPU out of memory ({error}); running it again "
+            if info.get("larger_than_gpu"):
+                stage = 2  # one request bigger than the whole GPU: alone would not help, nor would sizing
+            else:
+                sizes.out_of_memory()
+            log(f"{key}: GPU out of memory ({error[:160]}); running it again "
                 + ("alone on the GPU" if stage == 1 else "on the CPU")
-                + f"; GPU estimates now x{sizes.factor:.1f}")
+                + f"; GPU estimates x{sizes.factor:.1f}")
             from dataclasses import replace
 
             extra = {**target.extra, "gpu_retry": stage}

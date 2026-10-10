@@ -250,14 +250,14 @@ The backend is not part of the result hash, so runs can be resumed on either. Ea
 |---|---|
 | windowed lagged covariance sums | batched matmuls (`bmm`) |
 | PC basis, pooled and backbone PCA, randomized SVD | `eigh` / `qr` / `svd` |
-| ADMM band fits, per-residue 3×3 (most of the CPU time) | cuSOLVER batched Jacobi `eigh` |
+| ADMM band fits, per-residue 3×3 (most of the CPU time) | batched Jacobi rotations written as tensor ops (no cuSOLVER: its batched solver asked for 100–360 GB of workspace on real proteins) |
 | ADMM band fits, collective K×K (K up to 256) | **Newton–Schulz PSD projection** (matmuls only) |
 | subspace / per-band model predictions | `einsum` |
 | DCT baseline | projection onto an explicit orthonormal DCT-II basis |
 
 Archive decoding, metrics and aggregation stay on the CPU.
 
-**Why Newton–Schulz.** For matrices larger than 32×32, batched `torch.linalg.eigh` on CUDA falls back to solving one matrix at a time ([pytorch#175585](https://github.com/pytorch/pytorch/issues/175585)). That would make the GPU no faster than the Grace cores. The projection instead uses P₊(S) = (S + S·sign(S))/2, with sign(S) from 40 Newton–Schulz steps. Eigenvalues above ~10⁻⁶‖S‖ converge, and smaller ones contribute errors no larger than themselves, which ADMM tolerates. The final solution gets one exact eigendecomposition, so it is always PSD.
+**Why Newton–Schulz.** For matrices larger than 32×32, batched `torch.linalg.eigh` on CUDA falls back to solving one matrix at a time ([pytorch#175585](https://github.com/pytorch/pytorch/issues/175585)). That would make the GPU no faster than the Grace cores. The projection instead uses P₊(S) = (S + S·sign(S))/2, with sign(S) from 40 Newton–Schulz steps. Eigenvalues above ~10⁻⁶‖S‖ converge, and smaller ones contribute errors no larger than themselves, which ADMM tolerates. The final solution gets one exact eigendecomposition, so it is always PSD. Mid-sized eigendecompositions on the GPU run in chunks of 4,096 matrices to bound cuSOLVER's workspace.
 
 **Agreement.** The tests check every kernel against numpy, and the whole pipeline on `torch-cpu`. With exact projections the backends agree to rounding: ADMM takes the same number of iterations, and Stage-1 metrics differ by about 10⁻¹⁴. With Newton–Schulz, Stage-1 metrics agree to about 10⁻³ or better.
 
@@ -281,7 +281,7 @@ Throughput per GH200 is limited by memory, not cores, so the worker schedules by
 - **Admission.** It estimates each protein's host and GPU footprint (decoded trajectories, backbone PCA working set, batched fit state, runtime and CUDA context). A protein starts only when its footprint fits the remaining budget.
 - **Defaults.** On Isambard: up to `FLEXC_JOBS=32` in flight, `FLEXC_MEM_BUDGET_GB=95` of ~115 GB, `FLEXC_GPU_MEM_BUDGET_GB=80` of 96 GB.
 - **Order.** Largest proteins go first. Small ones backfill while a large one waits. After 60 s the waiting protein's memory is reserved so it can't starve, and a protein larger than the whole budget runs alone.
-- **GPU memory.** GPU estimates are multiplied by a factor (initially 4) that is recalibrated from the peak memory each finished protein actually used, because PyTorch's caching allocator and cuSOLVER workspaces add far more than the arrays themselves. A protein that still runs the GPU out of memory (including cuSOLVER failing to start for lack of memory) is not recorded as failed: the factor goes up 1.5x and the protein runs again alone on the GPU, then on the CPU if it must.
+- **GPU memory.** GPU estimates are multiplied by a factor (initially 4) that is recalibrated from the peak memory each finished protein actually used, because PyTorch's caching allocator and cuSOLVER workspaces add far more than the arrays themselves. A protein that still runs the GPU out of memory (including cuSOLVER failing to start for lack of memory) is not recorded as failed: the factor goes up 1.5x and the protein runs again alone on the GPU, then on the CPU if it must. A single request larger than the whole GPU goes straight to the CPU, and the factor is capped at 16. The worker log records where each GPU memory error happened.
 - **Systematic failures.** A worker stops starting proteins once more than half of its first 20+ have failed, and the finalize job stops the run (`action=failing`) instead of burning through the split.
 - **Crashes.** If a worker process is killed (for example for exceeding memory), the pool is rebuilt and the in-flight proteins are re-run one at a time. Only a protein that crashes on its own is reported failed, with a hint to lower `FLEXC_JOBS`.
 

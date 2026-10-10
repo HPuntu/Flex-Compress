@@ -100,7 +100,8 @@ DEFAULTS: dict = {
     "stages": {"stage0": True, "stage1": True},
     # Compute backend (not part of the result hash: devices agree to rounding).
     # device: auto (CUDA if torch sees a GPU, else numpy) | numpy | cuda | cuda:N | torch-cpu
-    # psd_method: auto (Newton-Schulz for >32x32 on CUDA, eigh otherwise) | eigh | newton_schulz
+    # psd_method: auto (on CUDA: Jacobi for <=4x4, Newton-Schulz for >32x32, chunked eigh between;
+    #             eigh on CPU) | eigh | newton_schulz | jacobi (Jacobi for <=4x4 on any device)
     "compute": {"device": "auto", "dtype": "float64", "psd_method": "auto", "ns_iters": 40},
     "aggregate": {"rank_threshold": [1.0, 1.1], "bootstrap": 1000},
     "seed": 20261009,

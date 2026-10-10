@@ -166,3 +166,28 @@ def test_diagnostics_untouched_by_backend(torch_cpu):
     var, vec, total = accel.top_pcs(x, 3)
     ref = dg.top_pcs(x, 3)
     np.testing.assert_allclose(var, ref[0], rtol=1e-9)
+
+
+def test_jacobi_psd_projection_matches_eigh():
+    """The CUDA path for 3x3 projections (no cuSOLVER workspace) is exact to rounding."""
+
+    torch = pytest.importorskip("torch")  # noqa: F841
+    from flexcompress import accel
+
+    accel.configure("torch-cpu", psd_method="jacobi")
+    try:
+        rng = np.random.default_rng(0)
+        m = rng.standard_normal((5000, 3, 3))
+        m = m + m.transpose(0, 2, 1)
+        special = np.stack([np.eye(3), np.zeros((3, 3)), np.diag([1.0, 1.0, -1.0]),
+                            np.outer([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]), -np.eye(3),
+                            np.array([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+                            np.diag([1e-300, 1.0, 1e8])])
+        m = np.concatenate([m, special, 1e-8 * m, 1e8 * m])
+        w, v = np.linalg.eigh(m)
+        ref = (v * np.clip(w, 0, None)[:, None, :]) @ v.transpose(0, 2, 1)
+        got = accel._np(accel._proj_exact(accel._t(m)))
+        scale = np.abs(m).max(axis=(1, 2), keepdims=True) + 1e-300
+        assert np.max(np.abs(got - ref) / scale) < 1e-12
+    finally:
+        accel.configure("numpy")
