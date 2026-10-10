@@ -20,7 +20,7 @@ FLEXC_RUNS_ROOT="${FLEXC_RUNS_ROOT:-$FLEXC_ROOT/flex-compress-runs}"
 FLEXC_CONDA="${FLEXC_CONDA:-$FLEXC_ROOT/miniforge3}"
 # First environment that activates wins: explicit choice, then the project's
 # GH200 DynaMode env (CUDA PyTorch), then the CPU-only env from setup_env.sh.
-FLEXC_ENV_CANDIDATES=("${FLEXC_ENV:-}" "${DYNAMODE_ENV:-}" dynamode-gh200 flexc)
+FLEXC_ENV_CANDIDATES=("${FLEXC_ENV:-}" "${DYNAMODE_ENV:-}" "$FLEXC_ROOT/envs/dynamode-gh200" dynamode-gh200 flexc)
 
 flexc_conda_init() {
   if [[ -f "$FLEXC_CONDA/bin/activate" ]]; then

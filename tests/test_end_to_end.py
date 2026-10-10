@@ -338,6 +338,52 @@ def test_target_failed_elsewhere_is_not_rerun(archive_root, tmp_path, monkeypatc
     assert len(calls) == 1
 
 
+def test_gpu_out_of_memory_is_retried_alone_then_on_cpu(archive_root, tmp_path, monkeypatch):
+    """A GPU out-of-memory is not a failure: the target runs again (alone, then on the CPU)."""
+
+    from flexcompress import accel
+
+    cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A"])
+    run_dir = tmp_path / "run_oom"
+    assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir),
+                     "--set", "folds.max_folds=1"]) == 0
+    real, calls = run.process_target, []
+
+    def flaky(target, cfg, log=print):
+        calls.append(dict(target.extra))
+        if len(calls) < 3:
+            raise RuntimeError("CUDA error: out of memory")
+        return real(target, cfg, log=log)
+
+    monkeypatch.setattr(run, "process_target", flaky)
+    monkeypatch.setattr(accel, "is_gpu_memory_error", lambda exc: "out of memory" in str(exc))
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy"]) == 0
+    assert calls == [{}, {"gpu_retry": 1}, {"gpu_retry": 2, "device": "numpy"}]
+    assert (run_dir / "results" / "atlas" / "1abc_A__T300.json").is_file()
+    assert not (run_dir / "errors").exists() or not list((run_dir / "errors").rglob("*.json"))
+
+
+def test_systematic_failures_stop_the_worker_and_the_rounds(archive_root, tmp_path, monkeypatch):
+    cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A"])
+    run_dir = tmp_path / "run_breaker"
+    assert run.main(["configure", "--config", str(cfg_path), "--run-dir", str(run_dir)]) == 0
+    listing = json.loads((run_dir / "targets.json").read_text())
+    template = listing["targets"][0]
+    listing["targets"] = [{**template, "domain_id": f"x{i:03d}_A"} for i in range(40)]
+    listing["n_targets"] = 40
+    (run_dir / "targets.json").write_text(json.dumps(listing))
+    _status(run_dir, "--round", "0")
+
+    def broken(target, cfg, log=print):
+        raise ValueError("bad archive layout")
+
+    monkeypatch.setattr(run, "process_target", broken)
+    assert run.main(["worker", "--run-dir", str(run_dir), "--device", "numpy"]) == 0
+    prog = json.loads(_status(run_dir))
+    assert prog["failed"] == 20 and prog["remaining"] == 20  # stopped after 20, half the split untouched
+    assert _status(run_dir, "--round", "1") == "action=failing"
+
+
 def test_worker_stops_before_the_walltime(archive_root, tmp_path):
     cfg_path = small_config(tmp_path, archive_root, "atlas", ["1abc_A", "2xyz_B"])
     run_dir = tmp_path / "run_deadline"

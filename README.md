@@ -194,7 +194,7 @@ The relevant limits (BriCS docs) are: `workq` partition, 24 h walltime, at most 
 ssh u6xq.aip2.isambard
 cd /projects/u6xq/hew && git clone --recurse-submodules <flex-compress-remote> Flex-Compress
 cd Flex-Compress && git -C DynaMode-dev checkout dev      # submodule tracks DynaMode-dev's dev branch
-source /projects/u6xq/hew/miniforge3/bin/activate dynamode-gh200
+source /projects/u6xq/hew/miniforge3/bin/activate /projects/u6xq/hew/envs/dynamode-gh200
 PYTHONPATH=src:DynaMode-dev/src python -m pytest -q      # ~1 min, synthetic data, includes torch-vs-numpy checks
 sbatch sbatch/bench.sbatch                                # GPU vs CPU timing + agreement on one GH200
 sbatch sbatch/bench.sbatch --throughput --devices cuda --jobs-list 8,16,32,48   # proteins/hour vs concurrency
@@ -281,6 +281,8 @@ Throughput per GH200 is limited by memory, not cores, so the worker schedules by
 - **Admission.** It estimates each protein's host and GPU footprint (decoded trajectories, backbone PCA working set, batched fit state, runtime and CUDA context). A protein starts only when its footprint fits the remaining budget.
 - **Defaults.** On Isambard: up to `FLEXC_JOBS=32` in flight, `FLEXC_MEM_BUDGET_GB=95` of ~115 GB, `FLEXC_GPU_MEM_BUDGET_GB=80` of 96 GB.
 - **Order.** Largest proteins go first. Small ones backfill while a large one waits. After 60 s the waiting protein's memory is reserved so it can't starve, and a protein larger than the whole budget runs alone.
+- **GPU memory.** GPU estimates are multiplied by a factor (initially 4) that is recalibrated from the peak memory each finished protein actually used, because PyTorch's caching allocator and cuSOLVER workspaces add far more than the arrays themselves. A protein that still runs the GPU out of memory (including cuSOLVER failing to start for lack of memory) is not recorded as failed: the factor goes up 1.5x and the protein runs again alone on the GPU, then on the CPU if it must.
+- **Systematic failures.** A worker stops starting proteins once more than half of its first 20+ have failed, and the finalize job stops the run (`action=failing`) instead of burning through the split.
 - **Crashes.** If a worker process is killed (for example for exceeding memory), the pool is rebuilt and the in-flight proteins are re-run one at a time. Only a protein that crashes on its own is reported failed, with a hint to lower `FLEXC_JOBS`.
 
 With 32 processes on one H100, kernels from different processes time-slice by default. `FLEXC_MPS=1` starts a CUDA MPS daemon inside each job so those kernels can run concurrently, and falls back to time-slicing if it can't start. Compare the two with:

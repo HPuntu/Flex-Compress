@@ -216,29 +216,61 @@ def available_cpus() -> int:
         return os.cpu_count() or 1
 
 
-def _process_one(run_dir: Path, cfg: dict, target, tag: str) -> tuple[str, str, float, str | None]:
-    """Run one target and write its outputs atomically; never raises."""
+def _device_of(backend: str) -> str:
+    """The ``--device`` value that selects ``backend`` (an ``accel.info()['backend']``)."""
+
+    if not backend.startswith("torch:"):
+        return "numpy"
+    dev = backend.split(":", 1)[1]
+    return "torch-cpu" if dev == "cpu" else dev
+
+
+GPU_RETRY = "gpu_retry"  # outcome status: the shared GPU ran out of memory; run the target again
+
+
+def _process_one(run_dir: Path, cfg: dict, target, tag: str) -> tuple:
+    """Run one target and write its outputs atomically; never raises.
+
+    Returns ``(key, status, seconds, error, info)``.  A GPU out-of-memory error
+    (or cuSOLVER failing for lack of memory) is not a property of the target:
+    it returns status ``gpu_retry`` and records no failure, and the worker runs
+    the target again, alone on the GPU and then on the CPU if need be.
+    ``target.extra["device"]`` forces a backend for this one target.
+    """
 
     out_json, out_npz, err_json = _result_paths(run_dir, target)
     started = time.monotonic()
-    log(f"{tag} {target.key}: start N={target.n_res} reps={len(target.replicas)} frames={target.n_frames}")
+    forced = target.extra.get("device")
+    previous = accel.info()["backend"]
+    if forced:
+        _configure_compute(cfg, forced)
+    log(f"{tag} {target.key}: start N={target.n_res} reps={len(target.replicas)} frames={target.n_frames}"
+        + (f" device={forced}" if forced else ""))
     try:
+        accel.reset_peak()
         result, descriptors = process_target(target, cfg, log=lambda m: log(f"{tag} {target.key}:{m}"))
+        info = {"gpu_peak_gb": accel.peak_gb()}
         result["finished"] = now_utc()
+        result["compute"]["gpu_peak_gb"] = info["gpu_peak_gb"]
         if descriptors is not None:
             atomic_write_npz(out_npz, **descriptors)
         atomic_write_json(out_json, result)
         if err_json.is_file():
             err_json.unlink()
-        return target.key, result["status"], time.monotonic() - started, None
+        return target.key, result["status"], time.monotonic() - started, None, info
     except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}".split("\n", 1)[0]
+        if accel.is_gpu_memory_error(exc):
+            return target.key, GPU_RETRY, time.monotonic() - started, message, {}
         atomic_write_json(err_json, {
             "target": target.to_dict(), "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(), "time": now_utc(), "compute": accel.info(),
         })
-        return target.key, "failed", time.monotonic() - started, f"{type(exc).__name__}: {exc}"
+        return target.key, "failed", time.monotonic() - started, message, {}
     finally:
         accel.release()
+        if forced:
+            _configure_compute(cfg, _device_of(previous))
 
 
 def _configure_compute(cfg: dict, device: str | None) -> str:
@@ -300,6 +332,10 @@ def worker(args) -> int:
     attempted: set[str] = set()
     claimed_at: dict[str, float] = {}
     outcomes: list = []
+    from .scheduler import AdaptiveFootprints
+
+    sizes = AdaptiveFootprints()
+    breaker = {"tripped": False}
     log(f"worker {label}: {len(targets)} targets in run; jobs={req_jobs} threads/job={threads} "
         f"cpus={available_cpus()} compute={accel.info()}; "
         + (f"walltime left {gate.time_left() / 3600:.1f} h; " if deadline else "no walltime; ")
@@ -318,6 +354,8 @@ def worker(args) -> int:
     def claim(target) -> bool:
         if target.key in queue.held():
             return True
+        if breaker["tripped"]:
+            return False
         if not gate.allows(target.cost) or not queue.try_claim(target.key):
             return False
         out_json, _, err_json = _result_paths(run_dir, target)
@@ -335,9 +373,24 @@ def worker(args) -> int:
         claimed_at[target.key] = time.time()
         return True
 
-    def finish(target, outcome) -> None:
-        outcomes.append(outcome)
-        key, status, seconds, error = outcome
+    def finish(target, outcome):
+        """Record an outcome; returns a target to run again (alone) after a GPU out-of-memory."""
+
+        key, status, seconds, error = outcome[:4]
+        info = outcome[4] if len(outcome) > 4 else {}
+        if status == GPU_RETRY:
+            stage = int(target.extra.get("gpu_retry", 0)) + 1
+            sizes.out_of_memory()
+            log(f"{key}: GPU out of memory ({error}); running it again "
+                + ("alone on the GPU" if stage == 1 else "on the CPU")
+                + f"; GPU estimates now x{sizes.factor:.1f}")
+            from dataclasses import replace
+
+            extra = {**target.extra, "gpu_retry": stage}
+            if stage >= 2:
+                extra["device"] = "numpy"
+            return replace(target, extra=extra)
+        outcomes.append(outcome[:4])
         if status == "failed":
             err_json = _result_paths(run_dir, target)[2]
             if not err_json.is_file() or err_json.stat().st_mtime < claimed_at.get(key, started) - 1.0:
@@ -346,13 +399,21 @@ def worker(args) -> int:
                                              "time": now_utc(), "compute": accel.info()})
         else:
             gate.record(target.cost, seconds)
+            sizes.observe(key, info.get("gpu_peak_gb"))
         queue.release(key)
         log(f"[{len(outcomes)}] {key}: {status} in {seconds:.1f}s" + (f" ({error})" if error else ""))
+        n_failed = sum(1 for o in outcomes if o[1] == "failed")
+        if not breaker["tripped"] and len(outcomes) >= 20 and n_failed > 0.5 * len(outcomes):
+            breaker["tripped"] = True
+            log(f"worker {label}: {n_failed} of {len(outcomes)} targets failed; starting no more "
+                f"(a systematic problem: see {run_dir / 'errors'})")
+        return None
 
     def serial(todo) -> None:
         for target in todo:
             if claim(target):
-                finish(target, _process_one(run_dir, cfg, target, f"[{len(outcomes) + 1}]"))
+                while target is not None:
+                    target = finish(target, _process_one(run_dir, cfg, target, f"[{len(outcomes) + 1}]"))
 
     def parallel(todo) -> None:
         import multiprocessing as mp
@@ -367,26 +428,26 @@ def worker(args) -> int:
             os.environ[name] = str(threads)
         ctx = mp.get_context("spawn")
         # Each child selects the same backend; GPU processes share the device.
-        child_device = device or (backend.split(":", 1)[1] if backend.startswith("torch:") else "numpy")
-        if child_device == "cpu" and backend.startswith("torch:"):
-            child_device = "torch-cpu"
+        child_device = device or _device_of(backend)
         gpu = backend.startswith("torch:cuda")
         host_budget = float(getattr(args, "mem_budget_gb", 0) or 0) or 0.85 * detect_host_memory_gb()
         gpu_budget = float(getattr(args, "gpu_mem_budget_gb", 0) or 0) or (
             0.85 * accel.device_memory_gb() if gpu else float("inf"))
-        footprints = {}
         for t in todo:
             stride = resolve_stride(t.frame_interval_ps, cfg.get("frame_interval_ps"))
-            footprints[t.key] = estimate_footprint(t, cfg, gpu=gpu, stride=stride)
-        biggest = max(footprints.values(), key=lambda f: f.host_gb)
+            sizes.base[t.key] = estimate_footprint(t, cfg, gpu=gpu, stride=stride)
+        biggest = max((sizes[t.key] for t in todo), key=lambda f: f.host_gb)
         log(f"memory budgets: host {host_budget:.0f} GB, gpu {gpu_budget:.0f} GB; "
-            f"largest target ~{biggest.host_gb:.1f} GB host / {biggest.gpu_gb:.1f} GB gpu")
+            f"largest target ~{biggest.host_gb:.1f} GB host / {biggest.gpu_gb:.1f} GB gpu "
+            f"(GPU estimates x{sizes.factor:.1f}, recalibrated from measured peaks)")
+        # Less fragmentation when many processes share the GPU (PyTorch >= 2.1).
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
         def make_executor():
             return ProcessPoolExecutor(max_workers=jobs, mp_context=ctx, initializer=_child_init,
                                        initargs=(str(run_dir), child_device))
 
-        run_admitted(make_executor, _child_run, todo, footprints, jobs, host_budget, gpu_budget, finish,
+        run_admitted(make_executor, _child_run, todo, sizes, jobs, host_budget, gpu_budget, finish,
                      claim=claim)
 
     try:
@@ -437,10 +498,14 @@ def status(args) -> int:
         return 0
     mine = [h for h in history if h.get("series", "default") == series]
     prev_settled = mine[-1].get("settled", mine[-1]["done"]) if mine else 0
+    new_done = prog["done"] - (mine[-1]["done"] if mine else 0)
+    new_failed = prog["failed"] - (mine[-1]["failed"] if mine else 0)
     if prog["complete"]:
         action = "finished"
     elif prog["remaining"] == 0:
         action = "waiting"  # only targets held by another live array are left; its finalize continues
+    elif new_failed >= 20 and new_failed > new_done:
+        action = "failing"  # mostly failures this round: a systematic problem, do not burn the split
     elif args.round >= args.max_rounds:
         action = "max_rounds"
     elif settled <= prev_settled:

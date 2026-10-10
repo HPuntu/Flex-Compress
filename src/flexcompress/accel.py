@@ -121,7 +121,46 @@ def release() -> None:
 
     torch = _S["torch"]
     if torch is not None and _S["device"].type == "cuda":
+        try:
+            torch.cuda.synchronize(_S["device"])
+        except Exception:  # a failed kernel may surface here; the cache is still released
+            pass
         torch.cuda.empty_cache()
+
+
+def on_gpu() -> bool:
+    return _S["torch"] is not None and _S["device"].type == "cuda"
+
+
+# Messages of errors caused by the GPU running short of memory: CUDA allocation
+# failures, and cuSOLVER/cuBLAS failing to create a handle or workspace.
+_GPU_MEMORY_MARKERS = ("out of memory", "CUSOLVER_STATUS_INTERNAL_ERROR", "CUSOLVER_STATUS_ALLOC_FAILED",
+                       "CUBLAS_STATUS_ALLOC_FAILED", "CUBLAS_STATUS_NOT_INITIALIZED", "cusolverDnCreate")
+
+
+def is_gpu_memory_error(exc: BaseException) -> bool:
+    """True if ``exc`` means the shared GPU ran short of memory (worth retrying), not a bug."""
+
+    if not on_gpu():
+        return False
+    text = f"{type(exc).__name__}: {exc}"
+    return any(marker in text for marker in _GPU_MEMORY_MARKERS)
+
+
+def reset_peak() -> None:
+    if on_gpu():
+        _S["torch"].cuda.reset_peak_memory_stats(_S["device"])
+
+
+def peak_gb() -> float | None:
+    """Peak GPU memory this process reserved since ``reset_peak`` (GB), plus its CUDA context."""
+
+    if not on_gpu():
+        return None
+    return _S["torch"].cuda.max_memory_reserved(_S["device"]) / 1e9 + CUDA_CONTEXT_GB
+
+
+CUDA_CONTEXT_GB = 0.6  # per-process CUDA context and library handles, outside the caching allocator
 
 
 def _t(x):

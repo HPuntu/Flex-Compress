@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["Footprint", "detect_host_memory_gb", "estimate_footprint", "run_admitted"]
+__all__ = ["AdaptiveFootprints", "Footprint", "detect_host_memory_gb", "estimate_footprint", "run_admitted"]
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,46 @@ def estimate_footprint(target, cfg: dict, gpu: bool, stride: int = 1) -> Footpri
     return Footprint(host, device)
 
 
+class AdaptiveFootprints:
+    """Footprints whose GPU part is corrected by what targets actually used.
+
+    ``estimate_footprint`` counts the arrays a target needs; on the GPU the
+    caching allocator, fragmentation and library workspaces add a large,
+    unknown factor.  GPU estimates are multiplied by ``factor``, which starts
+    conservative, is recalibrated from observed peaks (1.25 x the largest
+    observed/estimated ratio once three targets have finished), and is raised
+    1.5x whenever a target still runs out of GPU memory; it never drops below
+    a value set by such an increase.
+    """
+
+    def __init__(self, base: dict | None = None, factor: float = 4.0):
+        self.base: dict = dict(base or {})
+        self.factor = float(factor)
+        self.floor = 1.0
+        self.ratios: list[float] = []
+
+    def __getitem__(self, key) -> Footprint:
+        fp = self.base[key]
+        return Footprint(fp.host_gb, fp.gpu_gb * self.factor)
+
+    def __contains__(self, key) -> bool:
+        return key in self.base
+
+    def values(self):
+        return [self[k] for k in self.base]
+
+    def observe(self, key, peak_gb: float | None) -> None:
+        fp = self.base.get(key)
+        if not peak_gb or fp is None or fp.gpu_gb <= 0:
+            return
+        self.ratios.append(peak_gb / fp.gpu_gb)
+        if len(self.ratios) >= 3:
+            self.factor = max(self.floor, 1.25 * max(self.ratios))
+
+    def out_of_memory(self) -> None:
+        self.floor = self.factor = self.factor * 1.5
+
+
 def run_admitted(make_executor, func, tasks: list, footprints: dict, jobs: int, host_budget_gb: float,
                  gpu_budget_gb: float, on_done, reserve_after_s: float = 60.0, poll_s: float = 0.25,
                  claim=None) -> None:
@@ -110,7 +150,8 @@ def run_admitted(make_executor, func, tasks: list, footprints: dict, jobs: int, 
 
     ``make_executor()`` returns a fresh ``concurrent.futures`` process pool.
     ``tasks`` are ordered by priority (longest first); ``footprints`` maps
-    task.key -> Footprint; ``on_done(task, outcome)`` is called as each ends.
+    task.key -> Footprint; ``on_done(task, outcome)`` is called as each ends,
+    and may return a task to run again, alone (e.g. after a GPU out-of-memory).
     ``claim(task) -> bool``, if given, is asked right before a task starts;
     False drops it (another worker holds it, or it would not finish before
     the walltime).  It must return True again for a task it already accepted.
@@ -197,7 +238,9 @@ def run_admitted(make_executor, func, tasks: list, footprints: dict, jobs: int, 
                 running.pop(key)
                 used["host"] -= fp.host_gb
                 used["gpu"] -= fp.gpu_gb
-                on_done(task, outcome)
+                again = on_done(task, outcome)
+                if again is not None:
+                    suspects.append(again)
             if broken:
                 executor.shutdown(wait=False, cancel_futures=True)
                 executor = make_executor()

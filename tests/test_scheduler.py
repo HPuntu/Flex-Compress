@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 
 from flexcompress.config import DEFAULTS
 from flexcompress.data import Target
-from flexcompress.scheduler import Footprint, estimate_footprint, run_admitted
+from flexcompress.scheduler import AdaptiveFootprints, Footprint, estimate_footprint, run_admitted
 
 
 @dataclass
@@ -96,3 +96,35 @@ def test_footprint_estimates_scale_with_size():
     assert estimate_footprint(target(100, 10000), DEFAULTS, gpu=False).gpu_gb == 0.0
     strided = estimate_footprint(target(1000, 10000), DEFAULTS, gpu=True, stride=100)
     assert strided.host_gb < 0.5 * large.host_gb
+
+
+def test_on_done_can_requeue_a_task_to_run_alone():
+    _FP.clear()
+    _FP.update({k: Footprint(1.0, 0.0) for k in ("a", "b", "c")})
+    _STATE.update(host=0.0, peak=0.0, running=0, max_running=0)
+    seen, retried = [], set()
+
+    def on_done(task, outcome):
+        seen.append(task.key)
+        if task.key == "b" and "b" not in retried:  # e.g. GPU out of memory: once more, alone
+            retried.add("b")
+            return FakeTask("b", 0.02)
+        return None
+
+    run_admitted(lambda: ThreadPoolExecutor(max_workers=3), _thread_job, [FakeTask(k) for k in "abc"], _FP,
+                 jobs=3, host_budget_gb=10.0, gpu_budget_gb=float("inf"), on_done=on_done, poll_s=0.005)
+    assert sorted(seen) == ["a", "b", "b", "c"]
+
+
+def test_adaptive_gpu_footprints_learn_from_peaks_and_ooms():
+    sizes = AdaptiveFootprints({k: Footprint(1.0, 2.0) for k in "abcd"}, factor=4.0)
+    assert sizes["a"].gpu_gb == 8.0 and sizes["a"].host_gb == 1.0
+    sizes.observe("a", 3.0)
+    sizes.observe("b", 4.0)
+    assert sizes.factor == 4.0  # needs three observations
+    sizes.observe("c", 5.0)  # largest ratio 2.5 -> 1.25 x 2.5
+    assert abs(sizes.factor - 3.125) < 1e-12
+    sizes.out_of_memory()
+    assert abs(sizes.factor - 4.6875) < 1e-12
+    sizes.observe("d", 2.0)  # small peaks never lower it below the post-OOM floor
+    assert abs(sizes.factor - 4.6875) < 1e-12
